@@ -9,7 +9,8 @@ use super::pac;
 pub enum TxPower {
     /// -40 dBm
     Neg40Dbm,
-    /// -30 dBm
+    /// -30 dBm (nRF52811, nRF52832)
+    #[cfg(any(feature = "nrf52811", feature = "nrf52832"))]
     Neg30Dbm,
     /// -20 dBm
     Neg20Dbm,
@@ -112,6 +113,9 @@ impl Radio {
             let w = w.txpower();
             match power {
                 TxPower::Neg40Dbm => w.neg40d_bm(),
+                #[cfg(feature = "nrf52811")]
+                TxPower::Neg30Dbm => w.neg30d_bm(),
+                #[cfg(feature = "nrf52832")]
                 TxPower::Neg30Dbm => unsafe { w.bits(0xE2) },
                 TxPower::Neg20Dbm => w.neg20d_bm(),
                 TxPower::Neg16Dbm => w.neg16d_bm(),
@@ -140,13 +144,13 @@ impl Radio {
         let r = &self.regs;
         r.packetptr
             .write(|w| unsafe { w.packetptr().bits(pdu.as_ptr() as u32) });
-        r.tasks_txen.write(|w| w);
+        r.tasks_txen.write(|w| unsafe { w.bits(1) });
         while r.events_ready.read().bits() == 0 {}
         r.events_ready.write(|w| w);
-        r.tasks_start.write(|w| w);
+        r.tasks_start.write(|w| unsafe { w.bits(1) });
         while r.events_end.read().bits() == 0 {}
         r.events_end.write(|w| w);
-        r.tasks_disable.write(|w| w);
+        r.tasks_disable.write(|w| unsafe { w.bits(1) });
         while r.events_disabled.read().bits() == 0 {}
         r.events_disabled.write(|w| w);
     }
@@ -156,10 +160,10 @@ impl Radio {
         let r = &self.regs;
         r.packetptr
             .write(|w| unsafe { w.packetptr().bits(buf.as_ptr() as u32) });
-        r.tasks_rxen.write(|w| w);
+        r.tasks_rxen.write(|w| unsafe { w.bits(1) });
         while r.events_ready.read().bits() == 0 {}
         r.events_ready.write(|w| w);
-        r.tasks_start.write(|w| w);
+        r.tasks_start.write(|w| unsafe { w.bits(1) });
     }
 
     /// Poll for packet end. Returns the PDU length when a valid packet was
@@ -174,7 +178,7 @@ impl Radio {
         let pdu_len = 2 + (buf[1] as usize & 0x3F);
         r.events_end.write(|w| w);
         r.events_crcerror.write(|w| w);
-        r.tasks_disable.write(|w| w);
+        r.tasks_disable.write(|w| unsafe { w.bits(1) });
         while r.events_disabled.read().bits() == 0 {}
         r.events_disabled.write(|w| w);
         if !crc_ok {
@@ -186,7 +190,7 @@ impl Radio {
     /// Abort reception and disable the radio.
     pub fn receive_cancel(&self) {
         let r = &self.regs;
-        r.tasks_disable.write(|w| w);
+        r.tasks_disable.write(|w| unsafe { w.bits(1) });
         while r.events_disabled.read().bits() == 0 {}
         r.events_disabled.write(|w| w);
     }

@@ -162,6 +162,7 @@ pub struct Ble {
     own_addr_type: AddrType,
     adv_channel_idx: usize,
     scan_channel_idx: usize,
+    scan_cycle_start: u32,
     tx_buf: [u8; RX_PDU_MAX],
     tx_pdu_len: usize,
     rx_buf: [u8; RX_PDU_MAX],
@@ -192,6 +193,7 @@ impl Ble {
             own_addr_type: AddrType::Public,
             adv_channel_idx: 0,
             scan_channel_idx: 0,
+            scan_cycle_start: 0,
             tx_buf: [0; RX_PDU_MAX],
             tx_pdu_len: 0,
             rx_buf: [0; RX_PDU_MAX],
@@ -376,15 +378,19 @@ impl Ble {
         if self.scan_channel_idx >= 3 {
             self.scan_channel_idx = 0;
             let ticks = self.scan_accum.next(self.scan_params.interval);
-            let now = self.timer.now();
-            self.timer.set_compare(now.wrapping_add(ticks));
+            self.timer
+                .set_compare(self.scan_cycle_start.wrapping_add(ticks));
             return;
+        }
+        if self.scan_channel_idx == 0 {
+            self.scan_cycle_start = self.timer.now();
         }
         let channel = ADV_CHANNELS[self.scan_channel_idx];
         self.scan_channel_idx += 1;
         self.radio.set_channel(channel).ok();
         let per_channel = window_ticks(self.scan_params.window) / 3;
         let deadline = self.timer.now().wrapping_add(per_channel);
+        self.timer.set_compare(deadline);
         self.radio.receive_start(&mut self.rx_buf);
         loop {
             match self.radio.receive_poll(&self.rx_buf) {
@@ -430,6 +436,17 @@ impl Ble {
     /// Set the radio TX power.
     pub fn gap_tx_power_set(&mut self, power: TxPower) {
         self.radio.set_tx_power(power);
+    }
+
+    /// Current BLE scheduler time in 32 us ticks.
+    pub fn timer_now(&self) -> u32 {
+        self.timer.now()
+    }
+
+    /// True when a scheduler compare event is pending (i.e. `adv_tick` or
+    /// `scan_tick` is due).
+    pub fn timer_compare_pending(&self) -> bool {
+        self.timer.compare_pending()
     }
 
     fn build_adv_pdu(&mut self) {

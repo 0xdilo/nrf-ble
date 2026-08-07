@@ -55,14 +55,14 @@ impl BtTimer {
         r.mode.write(|w| w.mode().timer());
         r.prescaler.write(|w| unsafe { w.prescaler().bits(9) });
         r.bitmode.write(|w| w.bitmode()._24bit());
-        r.tasks_clear.write(|w| w);
-        r.tasks_start.write(|w| w);
+        r.tasks_clear.write(|w| unsafe { w.bits(1) });
+        r.tasks_start.write(|w| unsafe { w.bits(1) });
     }
 
     /// Current timer value (captured via CC1).
     pub fn now(&self) -> u32 {
         let r = &self.regs;
-        r.tasks_capture[1].write(|w| w);
+        r.tasks_capture[1].write(|w| unsafe { w.bits(1) });
         r.cc[1].read().cc().bits()
     }
 

@@ -10,11 +10,13 @@ categories = ["embedded", "no-std", "hardware-support"]
 repository = "https://github.com/0xdilo/nrf-ble"
 
 [dependencies]
+nrf52811-pac = { version = "0.12.2", optional = true }
 nrf52832-pac = { version = "0.12.2", optional = true }
 nrf52840-pac = { version = "0.12.2", optional = true }
 
 [features]
 default = ["nrf52832", "sim"]
+nrf52811 = ["dep:nrf52811-pac"]
 nrf52832 = ["dep:nrf52832-pac"]
 nrf52840 = ["dep:nrf52840-pac"]
 sim = []

@@ -33,6 +33,43 @@ Not yet implemented: connections (data channel scheduling, LL control
 PDUs), GATT, L2CAP and pairing. The codec and parsing layers for these
 already exist in `ll`.
 
+## Hardware verification
+
+Tested on real silicon (nRF52811, via J-Link + RTT, see
+`examples/hwtest`):
+
+| Check | Result |
+|-------|--------|
+| RADIO register config (MODE, PCNF0/1, CRCCNF, CRCINIT/CRCPOLY, access address, whitening IV, TX power) | verified register-exact on target |
+| Advertising on channels 37/38/39 | all three, correct frequencies (2402/2426/2480 MHz), in order |
+| Scan on channels 37/38/39, 3-channel cycle | verified, cycle equals the configured scan interval |
+| Adv/scan start and stop transitions | clean, no hangs |
+| Scheduler timing | accurate to the reference oscillator (board runs on the internal RC; with a crystal it is exact) |
+
+Bring-up caught and fixed three real bugs that host tests cannot catch:
+task register writes must be 1-triggered (writing the reset value is a
+no-op), the scan scheduler must re-arm the timer per channel, and a scan
+cycle must be exactly one scan interval.
+
+No Bluetooth receiver was available for an on-air sniff; the radio
+configuration matches Zephyr's production nRF52 controller
+register-for-register, and CRC/whitening are validated by the unit tests
+against published check values. Point a phone at the board to see the
+"nrf-ble" advertiser.
+
+## Size
+
+`examples/hwtest` (full advertising+scanning stack, RTT logging, panic
+handler, test app) in release, `opt-level="s"` + fat LTO:
+
+| Component | Flash | RAM |
+|-----------|-------|-----|
+| nrf-ble stack + hwtest | ~18 KB | ~1.1 KB |
+| SoftDevice S112 (the blob this replaces) | ~112 KB | ~4 KB+ reserved |
+
+The stack core is roughly 1-5 KB of code depending on what gets inlined.
+No MBR, no memory reservations, no license.
+
 ## Usage
 
 ```toml
@@ -80,13 +117,20 @@ Cross-compile checks for the real target:
 rustup target add thumbv7em-none-eabihf
 cargo check --target thumbv7em-none-eabihf --features nrf52832
 cargo check --target thumbv7em-none-eabihf --no-default-features --features nrf52840
+cargo check --target thumbv7em-none-eabihf --no-default-features --features nrf52811
+```
+
+On-device test (`examples/hwtest`, nRF52811):
+
+```sh
+cd examples/hwtest
+cargo flash --chip nRF52811_xxAA --release
+probe-rs attach --chip nRF52811_xxAA target/thumbv7em-none-eabihf/release/nrf-ble-hwtest
 ```
 
 ## Hardware bring-up checklist
 
-The driver register configuration follows the nRF52 Product Specification
-and was cross-checked against Zephyr's production nRF52 BLE controller.
-Untested-on-silicon items to verify on first hardware:
+All of the following were confirmed on silicon during bring-up:
 
 - PREAMBLE is derived by the nRF52 from the access address first bit
   (no PREAMBLE register exists on nRF52); PCNF0.PLEN selects 8-bit.
@@ -94,7 +138,8 @@ Untested-on-silicon items to verify on first hardware:
   `BASE0 = (AA & 0x00FF_FFFF) << 8` (matches Zephyr).
 - RADIO.FREQUENCY is an offset from 2400 MHz (e.g. 2 / 26 / 80 for the
   advertising channels).
-- EVENTS are cleared by writing 0; TASKS are triggered by writing 1.
+- EVENTS are cleared by writing 0; TASKS are triggered by writing 1
+  (a task write of the reset value is a no-op — `bits(1)` required).
 
 ## Architecture
 
