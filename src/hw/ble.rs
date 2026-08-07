@@ -5,7 +5,7 @@ use crate::ll::channels::ADV_CHANNELS;
 use crate::ll::pdu::{self, AdvPdu, ConnectReqData};
 use crate::Error;
 
-use super::conn::{Conn, ConnEvent, ConnRole, DisconnectReason};
+use super::conn::{BondInfo, BondStore, Conn, ConnEvent, ConnRole, DisconnectReason};
 use super::pac;
 use super::radio::{Radio, TxPower};
 use super::timers::{timeout_ticks, window_ticks, BtTimer, IntervalAccum};
@@ -349,7 +349,10 @@ impl Ble {
     /// Runs until [`Ble::gap_adv_stop`] is called from the event callback.
     pub fn adv_forever(&mut self, mut on_event: impl FnMut(&mut Self, BleEvent)) {
         loop {
-            while !self.timer.compare_pending() {}
+            while !self.timer.compare_pending() {
+                #[cfg(feature = "wfi")]
+                cortex_m::asm::wfi();
+            }
             self.adv_tick();
             self.drain_events(&mut |ble, evt| on_event(ble, evt));
             if self.adv_state == AdvState::Idle {
@@ -373,6 +376,21 @@ impl Ble {
             ..Default::default()
         };
         self.gap_scan_start(&params)
+    }
+
+    /// Save a bond (LTK/IRK keyed by peer address) to the store.
+    pub fn gap_bond_save(&mut self, peer: [u8; 6], ltk: [u8; 16], irk: Option<[u8; 16]>) {
+        if let Some(conn) = &mut self.conn {
+            conn.bond_store.save(peer, ltk, irk);
+        }
+    }
+
+    /// Look up a bond by peer address.
+    pub fn gap_bond_find(&mut self, peer: &[u8; 6]) -> Option<BondInfo> {
+        match &mut self.conn {
+            Some(conn) => conn.bond_store.find(peer),
+            None => None,
+        }
     }
 
     /// Add a device to the accept list (max 8 entries).
@@ -482,7 +500,10 @@ impl Ble {
     /// Runs until [`Ble::gap_scan_stop`] is called from the event callback.
     pub fn scan_forever(&mut self, mut on_event: impl FnMut(&mut Self, BleEvent)) {
         loop {
-            while !self.timer.compare_pending() {}
+            while !self.timer.compare_pending() {
+                #[cfg(feature = "wfi")]
+                cortex_m::asm::wfi();
+            }
             self.scan_tick();
             self.drain_events(&mut |ble, evt| on_event(ble, evt));
             if self.scan_state == ScanState::Idle {
@@ -834,6 +855,10 @@ impl Ble {
     /// the peer's write can be read via [`Ble::conn_rx_data`].
     pub fn conn_forever(&mut self, mut on_event: impl FnMut(&mut Self, BleEvent)) {
         while self.conn_tick() {
+            #[cfg(feature = "wfi")]
+            if !self.timer.compare_pending() {
+                cortex_m::asm::wfi();
+            }
             while let Some(evt) = self.next_event() {
                 on_event(self, evt);
             }

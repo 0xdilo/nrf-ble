@@ -53,6 +53,12 @@ pub enum Phy {
     Ble1Mbit,
     /// BLE 2 Mbit/s (LE 2M).
     Ble2Mbit,
+    /// BLE Coded PHY with S=8 (125 kbit/s, long range).
+    #[cfg(not(feature = "nrf52832"))]
+    BleCodedS8,
+    /// BLE Coded PHY with S=2 (500 kbit/s).
+    #[cfg(not(feature = "nrf52832"))]
+    BleCodedS2,
 }
 
 /// nRF52 RADIO driver.
@@ -79,6 +85,18 @@ impl Radio {
                 r.mode.write(|w| w.mode().ble_2mbit());
                 r.pcnf0
                     .modify(|_, w| unsafe { w.s1len().bits(8) }.plen()._16bit());
+            }
+            #[cfg(not(feature = "nrf52832"))]
+            Phy::BleCodedS8 => {
+                r.mode.write(|w| w.mode().ble_lr125kbit());
+                r.pcnf0
+                    .modify(|_, w| unsafe { w.s1len().bits(8) }.plen().long_range());
+            }
+            #[cfg(not(feature = "nrf52832"))]
+            Phy::BleCodedS2 => {
+                r.mode.write(|w| w.mode().ble_lr500kbit());
+                r.pcnf0
+                    .modify(|_, w| unsafe { w.s1len().bits(8) }.plen().long_range());
             }
         }
     }

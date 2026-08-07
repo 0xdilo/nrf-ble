@@ -86,6 +86,75 @@ pub const HANDLE_TX_CHAR_DECL: u16 = 0x0004;
 pub const HANDLE_TX_VALUE: u16 = 0x0005;
 pub const HANDLE_TX_CCCD: u16 = 0x0006;
 
+/// A stored bond: the LTK (and optional IRK) for a peer address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BondInfo {
+    /// Peer address.
+    pub addr: [u8; 6],
+    /// Long term key.
+    pub ltk: [u8; 16],
+    /// Optional identity resolving key.
+    pub irk: Option<[u8; 16]>,
+}
+
+/// Persistent storage for bonds (LTK/IRK per peer address).
+pub trait BondStore {
+    /// Store or replace the bond for a peer address.
+    fn save(&mut self, peer: [u8; 6], ltk: [u8; 16], irk: Option<[u8; 16]>);
+    /// Look up a bond by peer address.
+    fn find(&self, peer: &[u8; 6]) -> Option<BondInfo>;
+}
+
+/// Default in-RAM bond store (max 8 bonds).
+#[derive(Debug, Clone, Copy)]
+pub struct RamBondStore {
+    bonds: [Option<BondInfo>; 8],
+}
+
+impl Default for RamBondStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RamBondStore {
+    pub const fn new() -> Self {
+        RamBondStore { bonds: [None; 8] }
+    }
+}
+
+impl BondStore for RamBondStore {
+    fn save(&mut self, peer: [u8; 6], ltk: [u8; 16], irk: Option<[u8; 16]>) {
+        let info = BondInfo {
+            addr: peer,
+            ltk,
+            irk,
+        };
+        for slot in self.bonds.iter_mut() {
+            if let Some(b) = slot {
+                if b.addr == peer {
+                    *slot = Some(info);
+                    return;
+                }
+            }
+        }
+        for slot in self.bonds.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(info);
+                return;
+            }
+        }
+    }
+
+    fn find(&self, peer: &[u8; 6]) -> Option<BondInfo> {
+        self.bonds
+            .iter()
+            .flatten()
+            .copied()
+            .find(|b| &b.addr == peer)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// A credit-based connection-oriented L2CAP channel.
 pub struct Coc {
@@ -170,6 +239,7 @@ pub struct Conn {
     tx_pdu_max: usize,
     rx_pdu_max: usize,
     pub coc: Option<Coc>,
+    pub bond_store: RamBondStore,
     peer_version_ok: bool,
     pub last_rx: u32,
     terminate_pending: bool,
@@ -244,6 +314,7 @@ impl Conn {
             tx_pdu_max: LL_PDU_PAYLOAD_DEFAULT,
             rx_pdu_max: LL_PDU_PAYLOAD_DEFAULT,
             coc: None,
+            bond_store: RamBondStore::new(),
             peer_version_ok: false,
             last_rx: now,
             terminate_pending: false,

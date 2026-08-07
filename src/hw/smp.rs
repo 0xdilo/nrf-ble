@@ -604,7 +604,12 @@ mod sc_tests {
         a.peer_nonce = [9u8; 16];
         b.sc_nonce = [9u8; 16];
         b.peer_nonce = [7u8; 16];
-        assert_eq!(a.compute_ltk_sc(&a1, &a2), b.compute_ltk_sc(&a1, &a2));
+        let n1 = [7u8; 16];
+        let n2 = [9u8; 16];
+        assert_eq!(
+            a.compute_ltk_sc(&n1, &n2, &a1, &a2),
+            b.compute_ltk_sc(&n1, &n2, &a1, &a2)
+        );
     }
 
     #[test]
