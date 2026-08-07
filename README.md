@@ -48,6 +48,12 @@ PC Bluetooth adapter):
 - **Bonding**: LTK/IRK bond store (trait + in-RAM default).
 - **Extended advertising**: ADV_EXT_IND with auxiliary packets on data
   channels, and scanner aux-pointer chasing.
+- **Periodic advertising**: periodic info in the extended header and
+  periodic packets on data channels.
+- **HCI controller layer**: H4 UART framing and the LE controller command
+  set (advertising, scanning, connection, address, version) with stack
+  events mapped to HCI events, so a host can drive the stack.
+- **Flash-backed bonding**: NVMC-based bond store (erase-on-save page).
 - **Power**: optional `wfi` feature (WFI in the blocking loops).
 
 The PC's Bluetooth controller on this desk cannot transmit LE at all
@@ -56,7 +62,7 @@ CONNECT_REQs on air), and the second nRF is a bare-LL device with no
 L2CAP, so pairing/GATT could not be exercised against a live peer; both
 are covered by 64 host-side tests.
 
-Host-side (tested with `cargo test`, 89 tests):
+Host-side (tested with `cargo test`, 104 tests):
 
 - **Link Layer**: BLE CRC-24 (validated against the published check value
   `0xC25A56`), data whitening, advertising and data channel PDU codecs,
@@ -111,7 +117,7 @@ handler, test app) in release, `opt-level="s"` + fat LTO:
 
 | Component | Flash | RAM |
 |-----------|-------|-----|
-| nrf-ble stack + hwtest (everything above) | ~30 KB | ~1.5 KB |
+| nrf-ble stack + hwtest (everything above) | ~32 KB | ~1.5 KB |
 | SoftDevice S112 (the blob this replaces) | ~112 KB | ~4 KB+ reserved |
 
 The stack core is roughly 1-5 KB of code depending on what gets inlined.
@@ -183,7 +189,7 @@ handler, test app) in release, `opt-level="s"` + fat LTO:
 
 | Component | Flash | RAM |
 |-----------|-------|-----|
-| nrf-ble stack + hwtest (everything above) | ~30 KB | ~1.5 KB |
+| nrf-ble stack + hwtest (everything above) | ~32 KB | ~1.5 KB |
 | SoftDevice S112 (the blob this replaces) | ~112 KB | ~4 KB+ reserved |
 
 ## Hardware bring-up checklist
