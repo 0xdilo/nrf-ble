@@ -917,7 +917,7 @@ mod periodic_tests {
         let mut buf = [0u8; 32];
         let n = pdu.encode(&mut buf).unwrap();
         assert_eq!(n, 2 + 8 + 7 + 3);
-        assert_eq!(buf[10], EXT_AD_PERIODIC);
+        assert_eq!(buf[11], EXT_AD_PERIODIC);
         let decoded = AdvPdu::decode(&buf[..n]).unwrap();
         match decoded {
             AdvPdu::AuxAdvExtInd { ext_type, data, .. } => {
