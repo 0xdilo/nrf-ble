@@ -5,6 +5,7 @@ use crate::ll::channels::ADV_CHANNELS;
 use crate::ll::pdu::{self, AdvPdu, ConnectReqData};
 use crate::Error;
 
+use super::conn::{Conn, ConnEvent, ConnRole, DisconnectReason};
 use super::pac;
 use super::radio::{Radio, TxPower};
 use super::timers::{timeout_ticks, window_ticks, BtTimer, IntervalAccum};
@@ -12,6 +13,7 @@ use super::timers::{timeout_ticks, window_ticks, BtTimer, IntervalAccum};
 const EVENT_QUEUE_LEN: usize = 8;
 const RX_PDU_MAX: usize = 2 + 255;
 const SCAN_REQ_WINDOW_MICROS: u32 = 300;
+const CONNECT_REQ_WINDOW_MICROS: u32 = 90_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Advertising type (legacy advertising PDU).
@@ -113,6 +115,18 @@ pub enum BleEvent {
         /// Parsed connection parameters.
         conn: ConnectReqData,
     },
+    /// A connection was established (peripheral role).
+    Connected {
+        /// Connection parameters from the CONNECT_REQ.
+        conn: ConnectReqData,
+    },
+    /// The connection was closed.
+    Disconnected {
+        /// Why the connection ended.
+        reason: DisconnectReason,
+    },
+    /// The peer wrote data to the NUS RX characteristic.
+    ConnData,
     /// An advertising or scan response packet was received while scanning.
     ScanReport {
         /// Advertiser address.
@@ -163,6 +177,10 @@ pub struct Ble {
     adv_channel_idx: usize,
     scan_channel_idx: usize,
     scan_cycle_start: u32,
+    conn: Option<Conn>,
+    connect_target: Option<[u8; 6]>,
+    connect_target_type: AddrType,
+    last_radio_channel: Option<u8>,
     tx_buf: [u8; RX_PDU_MAX],
     tx_pdu_len: usize,
     rx_buf: [u8; RX_PDU_MAX],
@@ -194,6 +212,10 @@ impl Ble {
             adv_channel_idx: 0,
             scan_channel_idx: 0,
             scan_cycle_start: 0,
+            conn: None,
+            connect_target: None,
+            connect_target_type: AddrType::Public,
+            last_radio_channel: None,
             tx_buf: [0; RX_PDU_MAX],
             tx_pdu_len: 0,
             rx_buf: [0; RX_PDU_MAX],
@@ -298,7 +320,7 @@ impl Ble {
         self.radio.transmit(&self.tx_buf[..self.tx_pdu_len]);
         match self.adv_params.adv_type {
             AdvType::ConnectableUndirected | AdvType::ConnectableDirected => {
-                self.listen_for_scan_and_connect();
+                self.listen_for_scan_and_connect(channel);
             }
             AdvType::ScannableUndirected => {
                 self.listen_for_scan_req();
@@ -322,6 +344,23 @@ impl Ble {
                 break;
             }
         }
+    }
+
+    /// Start scanning.
+    /// Connect to a specific advertiser (initiator role).
+    pub fn gap_connect(&mut self, target: [u8; 6], target_type: AddrType) -> Result<(), Error> {
+        if self.scan_state != ScanState::Idle {
+            return Err(Error::AlreadyRunning);
+        }
+        self.connect_target = Some(target);
+        self.connect_target_type = target_type;
+        let params = ScanParams {
+            active: false,
+            interval: 100,
+            window: 90,
+            ..Default::default()
+        };
+        self.gap_scan_start(&params)
     }
 
     /// Start scanning.
@@ -387,6 +426,7 @@ impl Ble {
         }
         let channel = ADV_CHANNELS[self.scan_channel_idx];
         self.scan_channel_idx += 1;
+        self.last_radio_channel = Some(channel);
         self.radio.set_channel(channel).ok();
         let per_channel = window_ticks(self.scan_params.window) / 3;
         let deadline = self.timer.now().wrapping_add(per_channel);
@@ -489,7 +529,9 @@ impl Ble {
     }
 
     fn listen_for_scan_req(&mut self) {
-        if self.radio_window(1 << pdu::PDU_SCAN_REQ) && self.scan_rsp_len > 0 {
+        if self.radio_window(1 << pdu::PDU_SCAN_REQ, SCAN_REQ_WINDOW_MICROS)
+            && self.scan_rsp_len > 0
+        {
             let tx_add = self.own_addr_type.is_random();
             let len = AdvPdu::ScanRsp {
                 adv_addr: &self.own_addr,
@@ -501,9 +543,9 @@ impl Ble {
         }
     }
 
-    fn listen_for_scan_and_connect(&mut self) {
+    fn listen_for_scan_and_connect(&mut self, channel: u8) {
         let accept = (1 << pdu::PDU_SCAN_REQ) | (1 << pdu::PDU_CONNECT_REQ);
-        if !self.radio_window(accept) {
+        if !self.radio_window(accept, CONNECT_REQ_WINDOW_MICROS) {
             return;
         }
         match AdvPdu::decode(&self.rx_buf[..self.rx_pdu_len]) {
@@ -522,23 +564,24 @@ impl Ble {
             Ok(AdvPdu::ConnectReq {
                 init_addr, ll_data, ..
             }) => {
-                if let Ok(conn) = ConnectReqData::decode(ll_data) {
+                if let Ok(params) = ConnectReqData::decode(ll_data) {
+                    let init = *init_addr;
+                    let now = self.timer.now();
+                    self.conn = Some(Conn::new(&params, channel, now, ConnRole::Slave));
+                    self.adv_state = AdvState::Idle;
+                    self.push_event(BleEvent::Connected { conn: params });
                     self.push_event(BleEvent::ConnectReqReceived {
-                        init_addr: *init_addr,
-                        conn,
+                        init_addr: init,
+                        conn: params,
                     });
-                    self.adv_state = AdvState::StopPending;
                 }
             }
             _ => {}
         }
     }
 
-    fn radio_window(&mut self, accept_mask: u32) -> bool {
-        let deadline = self
-            .timer
-            .now()
-            .wrapping_add(timeout_ticks(SCAN_REQ_WINDOW_MICROS));
+    fn radio_window(&mut self, accept_mask: u32, window_micros: u32) -> bool {
+        let deadline = self.timer.now().wrapping_add(timeout_ticks(window_micros));
         self.radio.receive_start(&mut self.rx_buf);
         loop {
             match self.radio.receive_poll(&self.rx_buf) {
@@ -569,6 +612,12 @@ impl Ble {
             match pdu {
                 AdvPdu::AdvInd { adv_addr, data } | AdvPdu::AdvScanInd { adv_addr, data } => {
                     let addr = *adv_addr;
+                    if let Some(target) = self.connect_target {
+                        if addr == target {
+                            self.send_connect_req(true);
+                            return;
+                        }
+                    }
                     let mut buf = [0u8; 31];
                     let data_len = data.len().min(31);
                     buf[..data_len].copy_from_slice(&data[..data_len]);
@@ -591,6 +640,54 @@ impl Ble {
         if respond {
             self.respond_scan_req();
         }
+    }
+
+    fn radio_last_channel(&self) -> Option<u8> {
+        self.last_radio_channel
+    }
+
+    fn send_connect_req(&mut self, scannable: bool) {
+        let target = match self.connect_target {
+            Some(t) => t,
+            None => return,
+        };
+        let access_addr = 0x8E89_BED6 ^ 0x12_34_56_78;
+        let crc_init = 0x65_43_21;
+        let ll = ConnectReqData {
+            access_addr,
+            crc_init,
+            win_size: 1,
+            win_offset: 0,
+            interval: 24,
+            latency: 0,
+            timeout: 2000,
+            channel_map: [0xFF, 0xFF, 0xFF, 0xFF, 0x1F],
+            hop: 13,
+            sca: 2,
+        };
+        let mut llbuf = [0u8; 22];
+        if ll.encode(&mut llbuf).is_err() {
+            return;
+        }
+        let rx_add = self.connect_target_type.is_random();
+        let len = match (AdvPdu::ConnectReq {
+            init_addr: &self.own_addr,
+            adv_addr: &target,
+            ll_data: &llbuf,
+        })
+        .encode_typed(&mut self.tx_buf, self.own_addr_type.is_random(), rx_add)
+        {
+            Ok(len) => len,
+            Err(_) => return,
+        };
+        self.radio.transmit(&self.tx_buf[..len]);
+        self.connect_target = None;
+        let now = self.timer.now();
+        let channel = self.radio_last_channel().unwrap_or(37);
+        self.conn = Some(Conn::new(&ll, channel, now, ConnRole::Master));
+        self.scan_state = ScanState::Idle;
+        self.push_event(BleEvent::Connected { conn: ll });
+        let _ = scannable;
     }
 
     fn respond_scan_req(&mut self) {
@@ -649,6 +746,80 @@ impl Ble {
                 }
                 Err(_) => break,
             }
+        }
+    }
+
+    /// Drive the connection: run until the link is closed.
+    ///
+    /// The callback receives connection events; when `ConnData` is reported,
+    /// the peer's write can be read via [`Ble::conn_rx_data`].
+    pub fn conn_forever(&mut self, mut on_event: impl FnMut(&mut Self, BleEvent)) {
+        loop {
+            let outcome = if let Some(conn) = &mut self.conn {
+                let timeout = conn.timeout;
+                let now = self.timer.now();
+                let elapsed = now.wrapping_sub(conn.last_rx);
+                let limit = u32::from(timeout) * 313;
+                if elapsed >= limit {
+                    Some(DisconnectReason::SupervisionTimeout)
+                } else {
+                    match conn.event(&self.radio, &self.timer) {
+                        Ok(ConnEvent::Disconnected(reason)) => Some(reason),
+                        _ => None,
+                    }
+                }
+            } else {
+                Some(DisconnectReason::LocalError)
+            };
+            let has_data = self.conn.as_ref().is_some_and(|c| c.rx_data_len > 0);
+            if let Some(reason) = outcome {
+                self.conn = None;
+                self.radio.init();
+                self.push_event(BleEvent::Disconnected { reason });
+                while let Some(evt) = self.next_event() {
+                    on_event(self, evt);
+                }
+                break;
+            }
+            while let Some(evt) = self.next_event() {
+                on_event(self, evt);
+            }
+            if has_data {
+                if let Some(conn) = &mut self.conn {
+                    conn.rx_data_len = 0;
+                }
+                self.push_event(BleEvent::ConnData);
+                while let Some(evt) = self.next_event() {
+                    on_event(self, evt);
+                }
+            }
+        }
+    }
+
+    /// Data written by the peer to the NUS RX characteristic.
+    pub fn conn_rx_data(&self) -> &[u8] {
+        match &self.conn {
+            Some(conn) => &conn.rx_data[..conn.rx_data_len],
+            None => &[],
+        }
+    }
+
+    /// Queue a notification on the NUS TX characteristic.
+    pub fn conn_send(&mut self, data: &[u8]) -> Result<(), Error> {
+        match &mut self.conn {
+            Some(conn) => conn.queue_notify(data),
+            None => Err(Error::NotRunning),
+        }
+    }
+
+    /// Request termination (LL_TERMINATE_IND) at the next connection event.
+    pub fn gap_terminate(&mut self) -> Result<(), Error> {
+        match &mut self.conn {
+            Some(conn) => {
+                conn.terminate();
+                Ok(())
+            }
+            None => Err(Error::NotRunning),
         }
     }
 

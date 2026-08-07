@@ -9,19 +9,34 @@ pub const TICKS_PER_UNIT_DENOM: u32 = 32;
 /// Accumulates the fractional part of interval tick conversion so that
 /// long schedules never drift.
 pub struct IntervalAccum {
+    whole: u32,
+    frac_part: u32,
     frac: u32,
 }
 
 impl IntervalAccum {
-    /// Create a fresh accumulator.
+    /// Create a fresh accumulator for 0.625 ms units.
     pub const fn new() -> Self {
-        IntervalAccum { frac: 0 }
+        IntervalAccum {
+            whole: TICKS_PER_UNIT / TICKS_PER_UNIT_DENOM,
+            frac_part: TICKS_PER_UNIT % TICKS_PER_UNIT_DENOM,
+            frac: 0,
+        }
     }
 
-    /// Ticks to add for an interval of `units` (0.625 ms units).
+    /// Create an accumulator for 1.25 ms connection interval units.
+    pub const fn new_125ms() -> Self {
+        IntervalAccum {
+            whole: 39,
+            frac_part: 2,
+            frac: 0,
+        }
+    }
+
+    /// Ticks to add for an interval of `units`.
     pub fn next(&mut self, units: u16) -> u32 {
-        let base = u32::from(units) * (TICKS_PER_UNIT / TICKS_PER_UNIT_DENOM);
-        self.frac += u32::from(units) * (TICKS_PER_UNIT % TICKS_PER_UNIT_DENOM);
+        let base = u32::from(units) * self.whole;
+        self.frac += u32::from(units) * self.frac_part;
         let carry = self.frac / TICKS_PER_UNIT_DENOM;
         self.frac %= TICKS_PER_UNIT_DENOM;
         base + carry

@@ -10,7 +10,22 @@ nRF52 Product Specification.
 
 ## Status
 
-This is the foundation release. Working and tested (without hardware):
+Working and verified **on real hardware** (nRF52811, via J-Link + RTT + a
+PC Bluetooth adapter):
+
+- **Advertising**: our device is discovered by BlueZ as "nrf-ble" with the
+  correct name, flags and UUIDs (verified on air).
+- **Scanning**: decodes real advertisements byte-correctly (addresses, AD
+  structures, Apple manufacturer data, SCAN_REQs from other devices).
+- **Connections (master)**: initiates a connection to another BLE device
+  (a second nRF on the desk) with a proper CONNECT_REQ, anchor-aligned
+  connection events, channel hopping, empty-PDU exchange and supervision
+  timeout — the link held stable for minutes.
+- **GATT/ATT server**: Nordic UART Service with read/write/notify, covered
+  by host-side unit tests (MTU exchange, discovery, characteristic
+  reads/writes, CCCD, notifications).
+
+Host-side (tested with `cargo test`, 54 tests):
 
 - **Link Layer**: BLE CRC-24 (validated against the published check value
   `0xC25A56`), data whitening, advertising and data channel PDU codecs,
@@ -129,6 +144,16 @@ cd examples/hwtest
 cargo flash --chip nRF52811_xxAA --release
 probe-rs attach --chip nRF52811_xxAA target/thumbv7em-none-eabihf/release/nrf-ble-hwtest
 ```
+
+## Size
+
+`examples/hwtest` (full advertising + connection stack, RTT logging, panic
+handler, test app) in release, `opt-level="s"` + fat LTO:
+
+| Component | Flash | RAM |
+|-----------|-------|-----|
+| nrf-ble stack + hwtest | ~18 KB | ~1.1 KB |
+| SoftDevice S112 (the blob this replaces) | ~112 KB | ~4 KB+ reserved |
 
 ## Hardware bring-up checklist
 

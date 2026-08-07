@@ -34,8 +34,10 @@ pub(crate) use nrf52833_pac as pac;
 pub(crate) use nrf52840_pac as pac;
 
 mod ble;
+mod conn;
 mod radio;
 mod timers;
 
 pub use ble::{AdvParams, AdvType, Ble, BleEvent, FilterPolicy, ScanParams};
+pub use conn::{DisconnectReason, LL_CONTROL_FEATURE_REQ, LL_CONTROL_FEATURE_RSP};
 pub use radio::{Radio, TxPower};

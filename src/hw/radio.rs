@@ -106,6 +106,13 @@ impl Radio {
         Ok(())
     }
 
+    /// Set the CRC initial value (24-bit, normal form).
+    pub fn set_crc_init(&self, init: u32) {
+        self.regs
+            .crcinit
+            .write(|w| unsafe { w.crcinit().bits(init) });
+    }
+
     /// Set the TX power.
     pub fn set_tx_power(&self, power: TxPower) {
         let r = &self.regs;

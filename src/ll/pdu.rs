@@ -356,15 +356,7 @@ impl<'a> DataPdu<'a> {
     }
 
     /// Encode the PDU into `out`, returning the number of bytes written.
-    ///
-    /// The TxAdd/RxAdd header bits are cleared; use [`AdvPdu::encode_typed`]
-    /// when the address types are known.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
-        self.encode_typed(out, false, false)
-    }
-
-    /// Encode the PDU with explicit TxAdd/RxAdd address-type header bits.
-    pub fn encode_typed(&self, out: &mut [u8], tx_add: bool, rx_add: bool) -> Result<usize, Error> {
         if self.payload.len() > 0x3F {
             return Err(Error::InvalidLength);
         }
@@ -442,15 +434,7 @@ impl ConnectReqData {
     }
 
     /// Encode the PDU into `out`, returning the number of bytes written.
-    ///
-    /// The TxAdd/RxAdd header bits are cleared; use [`AdvPdu::encode_typed`]
-    /// when the address types are known.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
-        self.encode_typed(out, false, false)
-    }
-
-    /// Encode the PDU with explicit TxAdd/RxAdd address-type header bits.
-    pub fn encode_typed(&self, out: &mut [u8], tx_add: bool, rx_add: bool) -> Result<usize, Error> {
         if out.len() < CONNECT_LL_DATA_LEN {
             return Err(Error::BufferTooSmall);
         }
