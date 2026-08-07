@@ -11,6 +11,13 @@ pub enum AddrType {
     RandomPrivateNonResolvable,
 }
 
+impl AddrType {
+    /// True when the address is a random address (TxAdd/RxAdd bit = 1).
+    pub const fn is_random(&self) -> bool {
+        !matches!(self, AddrType::Public)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// A 6-byte Bluetooth device address.
 pub struct BtAddr {

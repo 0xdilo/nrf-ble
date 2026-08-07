@@ -175,7 +175,7 @@ impl Radio {
             return Ok(None);
         }
         let crc_ok = r.events_crcerror.read().bits() == 0;
-        let pdu_len = 2 + (buf[1] as usize & 0x3F);
+        let pdu_len = 2 + (((buf[1] >> 1) & 0x3F) as usize);
         r.events_end.write(|w| w);
         r.events_crcerror.write(|w| w);
         r.tasks_disable.write(|w| unsafe { w.bits(1) });

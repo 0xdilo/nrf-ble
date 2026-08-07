@@ -197,21 +197,27 @@ impl<'a> AdvPdu<'a> {
     }
 
     /// Encode the PDU into `out`, returning the number of bytes written.
-    /// Encode the PDU into `out`, returning the number of bytes written.
-    /// Encode the LLData field, returning the number of bytes written.
+    ///
+    /// The TxAdd/RxAdd header bits are cleared; use [`AdvPdu::encode_typed`]
+    /// when the address types are known.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
+        self.encode_typed(out, false, false)
+    }
+
+    /// Encode the PDU with explicit TxAdd/RxAdd address-type header bits.
+    pub fn encode_typed(&self, out: &mut [u8], tx_add: bool, rx_add: bool) -> Result<usize, Error> {
         if out.len() < 2 {
             return Err(Error::BufferTooSmall);
         }
         match *self {
             AdvPdu::AdvInd { adv_addr, data } => {
-                Self::encode_with(out, PDU_ADV_IND, false, false, 6 + data.len(), |o| {
+                Self::encode_with(out, PDU_ADV_IND, tx_add, false, 6 + data.len(), |o| {
                     o[..6].copy_from_slice(adv_addr);
                     o[6..].copy_from_slice(data);
                 })
             }
             AdvPdu::AdvScanInd { adv_addr, data } => {
-                Self::encode_with(out, PDU_ADV_SCAN_IND, false, false, 6 + data.len(), |o| {
+                Self::encode_with(out, PDU_ADV_SCAN_IND, tx_add, false, 6 + data.len(), |o| {
                     o[..6].copy_from_slice(adv_addr);
                     o[6..].copy_from_slice(data);
                 })
@@ -228,7 +234,7 @@ impl<'a> AdvPdu<'a> {
                 },
             ),
             AdvPdu::ScanRsp { adv_addr, data } => {
-                Self::encode_with(out, PDU_SCAN_RSP, false, false, 6 + data.len(), |o| {
+                Self::encode_with(out, PDU_SCAN_RSP, tx_add, false, 6 + data.len(), |o| {
                     o[..6].copy_from_slice(adv_addr);
                     o[6..].copy_from_slice(data);
                 })
@@ -236,14 +242,14 @@ impl<'a> AdvPdu<'a> {
             AdvPdu::AdvDirectInd {
                 adv_addr,
                 init_addr,
-            } => Self::encode_with(out, PDU_ADV_DIRECT_IND, false, false, 12, |o| {
+            } => Self::encode_with(out, PDU_ADV_DIRECT_IND, tx_add, false, 12, |o| {
                 o[..6].copy_from_slice(adv_addr);
                 o[6..12].copy_from_slice(init_addr);
             }),
             AdvPdu::ScanReq {
                 scan_addr,
                 adv_addr,
-            } => Self::encode_with(out, PDU_SCAN_REQ, false, false, 12, |o| {
+            } => Self::encode_with(out, PDU_SCAN_REQ, tx_add, rx_add, 12, |o| {
                 o[..6].copy_from_slice(scan_addr);
                 o[6..12].copy_from_slice(adv_addr);
             }),
@@ -251,7 +257,7 @@ impl<'a> AdvPdu<'a> {
                 init_addr,
                 adv_addr,
                 ll_data,
-            } => Self::encode_with(out, PDU_CONNECT_REQ, false, false, 34, |o| {
+            } => Self::encode_with(out, PDU_CONNECT_REQ, tx_add, rx_add, 34, |o| {
                 o[..6].copy_from_slice(init_addr);
                 o[6..12].copy_from_slice(adv_addr);
                 o[12..34].copy_from_slice(ll_data);
@@ -350,9 +356,15 @@ impl<'a> DataPdu<'a> {
     }
 
     /// Encode the PDU into `out`, returning the number of bytes written.
-    /// Encode the PDU into `out`, returning the number of bytes written.
-    /// Encode the LLData field, returning the number of bytes written.
+    ///
+    /// The TxAdd/RxAdd header bits are cleared; use [`AdvPdu::encode_typed`]
+    /// when the address types are known.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
+        self.encode_typed(out, false, false)
+    }
+
+    /// Encode the PDU with explicit TxAdd/RxAdd address-type header bits.
+    pub fn encode_typed(&self, out: &mut [u8], tx_add: bool, rx_add: bool) -> Result<usize, Error> {
         if self.payload.len() > 0x3F {
             return Err(Error::InvalidLength);
         }
@@ -430,9 +442,15 @@ impl ConnectReqData {
     }
 
     /// Encode the PDU into `out`, returning the number of bytes written.
-    /// Encode the PDU into `out`, returning the number of bytes written.
-    /// Encode the LLData field, returning the number of bytes written.
+    ///
+    /// The TxAdd/RxAdd header bits are cleared; use [`AdvPdu::encode_typed`]
+    /// when the address types are known.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
+        self.encode_typed(out, false, false)
+    }
+
+    /// Encode the PDU with explicit TxAdd/RxAdd address-type header bits.
+    pub fn encode_typed(&self, out: &mut [u8], tx_add: bool, rx_add: bool) -> Result<usize, Error> {
         if out.len() < CONNECT_LL_DATA_LEN {
             return Err(Error::BufferTooSmall);
         }

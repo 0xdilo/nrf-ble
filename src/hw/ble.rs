@@ -10,7 +10,7 @@ use super::radio::{Radio, TxPower};
 use super::timers::{timeout_ticks, window_ticks, BtTimer, IntervalAccum};
 
 const EVENT_QUEUE_LEN: usize = 8;
-const RX_PDU_MAX: usize = 2 + 37;
+const RX_PDU_MAX: usize = 2 + 255;
 const SCAN_REQ_WINDOW_MICROS: u32 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,6 +438,11 @@ impl Ble {
         self.radio.set_tx_power(power);
     }
 
+    /// The last advertising PDU built for transmission.
+    pub fn adv_pdu_snapshot(&self) -> &[u8] {
+        &self.tx_buf[..self.tx_pdu_len]
+    }
+
     /// Current BLE scheduler time in 32 us ticks.
     pub fn timer_now(&self) -> u32 {
         self.timer.now()
@@ -450,6 +455,7 @@ impl Ble {
     }
 
     fn build_adv_pdu(&mut self) {
+        let tx_add = self.own_addr_type.is_random();
         let len = match self.adv_params.adv_type {
             AdvType::ConnectableDirected => {
                 let peer = self.adv_params.peer_addr.unwrap();
@@ -457,26 +463,26 @@ impl Ble {
                     adv_addr: &self.own_addr,
                     init_addr: &peer,
                 }
-                .encode(&mut self.tx_buf)
+                .encode_typed(&mut self.tx_buf, tx_add, false)
                 .unwrap()
             }
             AdvType::ConnectableUndirected => AdvPdu::AdvInd {
                 adv_addr: &self.own_addr,
                 data: &self.adv_data[..self.adv_data_len],
             }
-            .encode(&mut self.tx_buf)
+            .encode_typed(&mut self.tx_buf, tx_add, false)
             .unwrap(),
             AdvType::ScannableUndirected => AdvPdu::AdvScanInd {
                 adv_addr: &self.own_addr,
                 data: &self.adv_data[..self.adv_data_len],
             }
-            .encode(&mut self.tx_buf)
+            .encode_typed(&mut self.tx_buf, tx_add, false)
             .unwrap(),
             AdvType::NonConnectableUndirected => AdvPdu::AdvNonconnInd {
                 adv_addr: &self.own_addr,
                 data: &self.adv_data[..self.adv_data_len],
             }
-            .encode(&mut self.tx_buf)
+            .encode_typed(&mut self.tx_buf, tx_add, false)
             .unwrap(),
         };
         self.tx_pdu_len = len;
@@ -484,11 +490,12 @@ impl Ble {
 
     fn listen_for_scan_req(&mut self) {
         if self.radio_window(1 << pdu::PDU_SCAN_REQ) && self.scan_rsp_len > 0 {
+            let tx_add = self.own_addr_type.is_random();
             let len = AdvPdu::ScanRsp {
                 adv_addr: &self.own_addr,
                 data: &self.scan_rsp[..self.scan_rsp_len],
             }
-            .encode(&mut self.tx_buf)
+            .encode_typed(&mut self.tx_buf, tx_add, false)
             .unwrap();
             self.radio.transmit(&self.tx_buf[..len]);
         }
@@ -502,11 +509,12 @@ impl Ble {
         match AdvPdu::decode(&self.rx_buf[..self.rx_pdu_len]) {
             Ok(AdvPdu::ScanReq { adv_addr, .. }) => {
                 if self.scan_rsp_len > 0 {
+                    let tx_add = self.own_addr_type.is_random();
                     let len = AdvPdu::ScanRsp {
                         adv_addr,
                         data: &self.scan_rsp[..self.scan_rsp_len],
                     }
-                    .encode(&mut self.tx_buf)
+                    .encode_typed(&mut self.tx_buf, tx_add, false)
                     .unwrap();
                     self.radio.transmit(&self.tx_buf[..len]);
                 }
@@ -590,11 +598,13 @@ impl Ble {
             Ok(a) => a,
             Err(_) => return,
         };
+        let tx_add = self.own_addr_type.is_random();
+        let rx_add = BtAddr::parse(adv_addr).addr_type.is_random();
         let len = match (AdvPdu::ScanReq {
             scan_addr: &self.own_addr,
             adv_addr: &adv_addr,
         })
-        .encode(&mut self.tx_buf)
+        .encode_typed(&mut self.tx_buf, tx_add, rx_add)
         {
             Ok(len) => len,
             Err(_) => return,
