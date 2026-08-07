@@ -3,9 +3,18 @@
 
 use cortex_m_rt::entry;
 use nrf52811_pac as pac;
-use nrf_ble::hw::{Ble, BleEvent};
+use nrf_ble::hw::{AdvParams, AdvType, Ble, BleEvent};
 use nrf_ble::ll::addr::AddrType;
 use rtt_target::{rtt_init_print, rprintln};
+
+fn adv_params() -> AdvParams {
+    AdvParams {
+        interval_min: 160,
+        interval_max: 160,
+        adv_type: AdvType::ConnectableUndirected,
+        ..Default::default()
+    }
+}
 
 #[entry]
 fn main() -> ! {
@@ -16,47 +25,43 @@ fn main() -> ! {
     p.CLOCK.tasks_hfclkstart.write(|w| unsafe { w.bits(1) });
 
     let mut ble = Ble::new(p.RADIO, p.TIMER0, p.CCM);
-    ble.gap_address_set([0xC1, 0xBE, 0xEF, 0x20, 0x25, 0x08], AddrType::RandomStatic);
-
-    let target = [0xDF, 0xCD, 0x01, 0xD5, 0xE5, 0xEF];
-    rprintln!("connecting to {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        target[0], target[1], target[2], target[3], target[4], target[5]);
-    ble.gap_connect(target, AddrType::Public).unwrap();
+    ble.gap_address_set([0x08, 0x25, 0x20, 0xEF, 0xBE, 0xC1], AddrType::RandomStatic);
+    let adv_data = [
+        0x02, 0x01, 0x06,
+        0x08, 0x09, b'n', b'r', b'f', b'-', b'b', b'l', b'e',
+    ];
+    ble.gap_adv_set_configure(&adv_data, &[]).unwrap();
 
     loop {
-        while !ble.timer_compare_pending() {}
-        ble.scan_tick();
-        if let Some(BleEvent::Connected { conn }) = ble.next_event() {
-            rprintln!(
-                "CONNECTED: interval={} timeout={} aa={:08x}",
-                conn.interval, conn.timeout, conn.access_addr
-            );
-            break;
-        }
-    }
+        ble.gap_adv_start(&adv_params()).unwrap();
+        rprintln!("nrf-ble hwtest: advertising, waiting for connection");
 
-    rprintln!("connection ok, requesting pairing (peer has no L2CAP, expect silence)");
-    ble.gap_pair().ok();
-
-    let mut ticks = 0u32;
-    loop {
-        while !ble.timer_compare_pending() {}
-        if !ble.conn_tick() {
-            rprintln!("DISCONNECTED");
-            loop {
-                cortex_m::asm::wfi();
+        ble.adv_forever(|ble, evt| {
+            if let BleEvent::Connected { conn } = evt {
+                rprintln!(
+                    "CONNECTED: interval={} timeout={} aa={:08x} crc=0x{:06x}",
+                    conn.interval, conn.timeout, conn.access_addr, conn.crc_init
+                );
+                ble.conn_send(b"hello from nrf-ble!").ok();
             }
-        }
-        ticks += 1;
-        if ticks % 500 == 0 {
-            rprintln!("conn tick {}", ticks);
-        }
-        while let Some(evt) = ble.next_event() {
-            rprintln!("evt: {:?}", evt);
-        }
-        if let Some((op, buf, len)) = ble.gatt_poll() {
-            rprintln!("gatt: op=0x{:02x} {:02x?}", op, &buf[..len.min(20)]);
-        }
+        });
+
+        rprintln!("nrf-ble hwtest: driving connection");
+        ble.conn_forever(|ble, evt| match evt {
+            BleEvent::ConnData => {
+                let data = ble.conn_rx_data();
+                let mut buf = [0u8; 20];
+                let n = data.len();
+                buf[..n].copy_from_slice(data);
+                rprintln!("rx: {:?}", &buf[..n]);
+                ble.conn_send(&buf[..n]).ok();
+            }
+            BleEvent::Disconnected { reason } => {
+                rprintln!("DISCONNECTED: {:?}", reason);
+            }
+            other => rprintln!("conn evt: {:?}", other),
+        });
+        rprintln!("nrf-ble hwtest: connection closed, restarting");
     }
 }
 

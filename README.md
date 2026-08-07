@@ -21,11 +21,30 @@ PC Bluetooth adapter):
   (a second nRF on the desk) with a proper CONNECT_REQ, anchor-aligned
   connection events, channel hopping, empty-PDU exchange and supervision
   timeout — the link held stable for minutes.
-- **GATT/ATT server**: Nordic UART Service with read/write/notify, covered
-  by host-side unit tests (MTU exchange, discovery, characteristic
-  reads/writes, CCCD, notifications).
+- **Connections (slave)**: accept CONNECT_REQ while advertising, with the
+  same connection state machine (needs an initiator with a working radio;
+  this PC's controller cannot transmit LE, so it was verified via the
+  master path and unit tests).
+- **GATT/ATT server**: Nordic UART Service with read/write/notify.
+- **GATT client**: primary service/characteristic discovery, read, write,
+  subscribe with request/response correlation.
+- **SMP**: legacy Just Works pairing (C1/S1 crypto cross-validated against
+  an independent Python AES-128 reference), pairing request/response/
+  confirm/random exchange, failure handling.
+- **LL encryption**: ENCRYPT_REQ/RSP + START_ENC_REQ/RSP handshake and the
+  encrypted data path via the nRF52 CCM peripheral (13-byte BLE nonce,
+  4-byte MIC, per-event packet counter, direction byte).
+- **LL**: connection parameter update (instant-based), PHY negotiation
+  (2M), 2 Mbit/s radio mode, channel map handling, supervision timeout,
+  terminate.
 
-Host-side (tested with `cargo test`, 54 tests):
+The PC's Bluetooth controller on this desk cannot transmit LE at all
+(verified with a continuous 3-channel listener: zero advertisements, zero
+CONNECT_REQs on air), and the second nRF is a bare-LL device with no
+L2CAP, so pairing/GATT could not be exercised against a live peer; both
+are covered by 64 host-side tests.
+
+Host-side (tested with `cargo test`, 64 tests):
 
 - **Link Layer**: BLE CRC-24 (validated against the published check value
   `0xC25A56`), data whitening, advertising and data channel PDU codecs,
@@ -80,7 +99,7 @@ handler, test app) in release, `opt-level="s"` + fat LTO:
 
 | Component | Flash | RAM |
 |-----------|-------|-----|
-| nrf-ble stack + hwtest | ~18 KB | ~1.1 KB |
+| nrf-ble stack + hwtest (full: adv + conns + GATT + SMP + encryption) | ~28 KB | ~1.5 KB |
 | SoftDevice S112 (the blob this replaces) | ~112 KB | ~4 KB+ reserved |
 
 The stack core is roughly 1-5 KB of code depending on what gets inlined.
@@ -152,7 +171,7 @@ handler, test app) in release, `opt-level="s"` + fat LTO:
 
 | Component | Flash | RAM |
 |-----------|-------|-----|
-| nrf-ble stack + hwtest | ~18 KB | ~1.1 KB |
+| nrf-ble stack + hwtest (full: adv + conns + GATT + SMP + encryption) | ~28 KB | ~1.5 KB |
 | SoftDevice S112 (the blob this replaces) | ~112 KB | ~4 KB+ reserved |
 
 ## Hardware bring-up checklist
