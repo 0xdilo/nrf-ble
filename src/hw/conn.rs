@@ -1,7 +1,10 @@
 //! LE connection (peripheral role), L2CAP-lite and a minimal GATT/ATT
 //! server (Nordic UART Service).
 
-use crate::ll::pdu::{ConnectReqData, DataPdu, LLID_CONTROL, LLID_DATA_COMPLETE};
+use crate::ll::pdu::{
+    ConnectReqData, DataPdu, LLID_CONTROL, LLID_DATA_COMPLETE, LLID_DATA_CONTINUATION_OR_COMPLETE,
+    LLID_DATA_START,
+};
 use crate::Error;
 
 use super::ccm::{Ccm, LL_MIC_LEN, LL_NONCE_MASTER_TO_SLAVE, LL_NONCE_SLAVE_TO_MASTER};
@@ -30,14 +33,24 @@ pub const LL_CONTROL_START_ENC_REQ: u8 = 0x09;
 pub const LL_CONTROL_START_ENC_RSP: u8 = 0x0A;
 pub const LL_CONTROL_PHY_REQ: u8 = 0x0E;
 pub const LL_CONTROL_PHY_RSP: u8 = 0x0F;
+pub const LL_CONTROL_LENGTH_REQ: u8 = 0x13;
+pub const LL_CONTROL_LENGTH_RSP: u8 = 0x14;
 
 /// L2CAP channel ID for the ATT protocol.
 pub const L2CAP_ATT_CID: u16 = 0x0004;
 
 /// ATT MTU of the server.
-pub const ATT_MTU: usize = 23;
+pub const ATT_MTU_DEFAULT: usize = 23;
+/// Maximum supported ATT MTU.
+pub const ATT_MTU_MAX: usize = 247;
 /// Maximum ATT payload (MTU minus ATT header).
-pub const ATT_PAYLOAD: usize = ATT_MTU - 3;
+pub const ATT_PAYLOAD_MAX: usize = ATT_MTU_MAX - 3;
+/// Maximum L2CAP payload (ATT + 4-byte L2CAP header).
+pub const L2CAP_PAYLOAD_MAX: usize = ATT_MTU_MAX + 4;
+/// Default maximum LL data PDU payload before DLE.
+pub const LL_PDU_PAYLOAD_DEFAULT: usize = 27;
+/// Maximum LL data PDU payload after DLE.
+pub const LL_PDU_PAYLOAD_MAX: usize = 251;
 
 pub const GATT_UUID_PRIMARY_SERVICE: u16 = 0x2800;
 pub const GATT_UUID_CHARACTERISTIC: u16 = 0x2803;
@@ -82,16 +95,21 @@ pub struct Conn {
     nesn: bool,
     anchor: u32,
     accum: IntervalAccum,
-    rx_l2cap: [u8; 64],
+    rx_l2cap: [u8; 256],
     rx_l2cap_len: usize,
-    tx_att: [u8; ATT_PAYLOAD + 4],
+    rx_l2cap_msg_len: usize,
+    tx_att: [u8; L2CAP_PAYLOAD_MAX],
     tx_att_len: usize,
+    tx_frag_offset: usize,
     tx_pending: bool,
+    att_mtu: u16,
+    tx_pdu_max: usize,
+    rx_pdu_max: usize,
     peer_version_ok: bool,
     pub last_rx: u32,
     terminate_pending: bool,
     pub nus_cccd: u8,
-    pub rx_data: [u8; ATT_PAYLOAD],
+    pub rx_data: [u8; ATT_PAYLOAD_MAX],
     pub rx_data_len: usize,
     tx_buf: [u8; 64],
     rx_buf: [u8; 64],
@@ -148,16 +166,21 @@ impl Conn {
             nesn: false,
             anchor,
             accum: IntervalAccum::new_125ms(),
-            rx_l2cap: [0; 64],
+            rx_l2cap: [0; 256],
             rx_l2cap_len: 0,
-            tx_att: [0; ATT_PAYLOAD + 4],
+            rx_l2cap_msg_len: 0,
+            tx_att: [0; L2CAP_PAYLOAD_MAX],
             tx_att_len: 0,
+            tx_frag_offset: 0,
             tx_pending: false,
+            att_mtu: ATT_MTU_DEFAULT as u16,
+            tx_pdu_max: LL_PDU_PAYLOAD_DEFAULT,
+            rx_pdu_max: LL_PDU_PAYLOAD_DEFAULT,
             peer_version_ok: false,
             last_rx: now,
             terminate_pending: false,
             nus_cccd: 0,
-            rx_data: [0; ATT_PAYLOAD],
+            rx_data: [0; ATT_PAYLOAD_MAX],
             rx_data_len: 0,
             tx_buf: [0; 64],
             rx_buf: [0; 64],
@@ -178,7 +201,7 @@ impl Conn {
     }
 
     pub fn queue_notify(&mut self, data: &[u8]) -> Result<(), Error> {
-        let len = data.len().min(ATT_PAYLOAD);
+        let len = data.len().min(ATT_PAYLOAD_MAX);
         self.tx_att[0] = 0x1B;
         self.tx_att[1..3].copy_from_slice(&HANDLE_TX_VALUE.to_le_bytes());
         self.tx_att[3..3 + len].copy_from_slice(&data[..len]);
@@ -287,9 +310,7 @@ impl Conn {
                     if new_data {
                         self.nesn = pdu_sn;
                     }
-                    let before = self.rx_data_len;
-                    self.handle_l2cap(&payload[..plen], new_data, &mut result);
-                    let _ = before;
+                    self.handle_l2cap(&payload[..plen], pdu_llid, &mut result);
                 }
             }
         }
@@ -347,7 +368,7 @@ impl Conn {
                                 }
                                 result = ConnEvent::Control(payload[0]);
                             } else {
-                                self.handle_l2cap(&payload[..plen], true, &mut result);
+                                self.handle_l2cap(&payload[..plen], pdu.llid, &mut result);
                             }
                         }
                     }
@@ -366,6 +387,48 @@ impl Conn {
             }
         }
         Ok(result)
+    }
+
+    /// Build the next data channel fragment of the pending L2CAP PDU into
+    /// `tx_buf`, returning the total packet length (2 + payload). Advances
+    /// the fragment offset and clears the pending flag on the final
+    /// fragment.
+    pub fn tx_fragment(&mut self) -> usize {
+        let att_len = self.tx_att_len;
+        let remaining = att_len - self.tx_frag_offset;
+        let first = self.tx_frag_offset == 0;
+        let avail = if first {
+            self.tx_pdu_max.saturating_sub(4)
+        } else {
+            self.tx_pdu_max
+        };
+        let chunk = remaining.min(avail);
+        let complete = first && chunk == att_len;
+        let llid = if complete {
+            LLID_DATA_COMPLETE
+        } else if first {
+            LLID_DATA_START
+        } else {
+            LLID_DATA_CONTINUATION_OR_COMPLETE
+        };
+        let payload_len = if first { 4 + chunk } else { chunk };
+        self.tx_buf[0] = (llid & 0b11) | ((!self.nesn as u8) << 2) | ((self.sn as u8) << 3);
+        self.tx_buf[1] = payload_len as u8;
+        if first {
+            self.tx_buf[2..4].copy_from_slice(&(att_len as u16).to_le_bytes());
+            self.tx_buf[4..6].copy_from_slice(&L2CAP_ATT_CID.to_le_bytes());
+            self.tx_buf[6..6 + chunk]
+                .copy_from_slice(&self.tx_att[self.tx_frag_offset..self.tx_frag_offset + chunk]);
+        } else {
+            self.tx_buf[2..2 + chunk]
+                .copy_from_slice(&self.tx_att[self.tx_frag_offset..self.tx_frag_offset + chunk]);
+        }
+        self.tx_frag_offset += chunk;
+        if self.tx_frag_offset >= att_len {
+            self.tx_pending = false;
+            self.tx_frag_offset = 0;
+        }
+        2 + payload_len
     }
 
     fn tx(&mut self, radio: &Radio, len: usize) {
@@ -418,21 +481,8 @@ impl Conn {
             return;
         }
         if self.tx_pending {
-            let att = &self.tx_att[..self.tx_att_len];
-            let payload_len = att.len() + 4;
-            header(
-                &mut self.tx_buf,
-                LLID_DATA_COMPLETE,
-                !self.nesn,
-                self.sn,
-                payload_len as u8,
-            );
-            self.tx_buf[2..4].copy_from_slice(&(att.len() as u16).to_le_bytes());
-            self.tx_buf[4..6].copy_from_slice(&L2CAP_ATT_CID.to_le_bytes());
-            self.tx_buf[6..6 + att.len()].copy_from_slice(att);
-            let total = 2 + payload_len;
+            let total = self.tx_fragment();
             self.sn = !self.sn;
-            self.tx_pending = false;
             let _ = timer;
             self.tx(radio, total);
         } else {
@@ -546,32 +596,37 @@ impl Conn {
         self.want_encrypt = true;
     }
 
-    fn handle_l2cap(&mut self, payload: &[u8], new_data: bool, result: &mut ConnEvent) {
-        if payload.len() < 4 {
-            return;
+    fn handle_l2cap(&mut self, payload: &[u8], llid: u8, result: &mut ConnEvent) {
+        let is_first = llid != LLID_DATA_CONTINUATION_OR_COMPLETE || self.rx_l2cap_len == 0;
+        if is_first {
+            if payload.len() < 4 {
+                return;
+            }
+            self.rx_l2cap_len = 0;
+            self.rx_l2cap_msg_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+            let cid = u16::from_le_bytes([payload[2], payload[3]]);
+            if cid == L2CAP_SMP_CID {
+                let body = &payload[4..];
+                self.handle_smp(body, result);
+                self.rx_l2cap_len = 0;
+                return;
+            }
+            if cid != L2CAP_ATT_CID {
+                *result = ConnEvent::L2cap(cid);
+                self.rx_l2cap_len = 0;
+                return;
+            }
         }
-        let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-        let cid = u16::from_le_bytes([payload[2], payload[3]]);
-        if cid == L2CAP_SMP_CID {
-            let body = &payload[4..];
-            self.handle_smp(body, result);
-            return;
-        }
-        if cid != L2CAP_ATT_CID {
-            *result = ConnEvent::L2cap(cid);
-            return;
-        }
-        let body = &payload[4..];
-        let _ = new_data;
+        let body = if is_first { &payload[4..] } else { payload };
         let cap = self.rx_l2cap.len();
-        let n = body.len().min(cap);
-        self.rx_l2cap[..n].copy_from_slice(&body[..n]);
-        self.rx_l2cap_len = body.len();
-        if self.rx_l2cap_len >= len.min(cap) {
-            let alen = len.min(cap);
-            let mut att = [0u8; 64];
-            att[..alen].copy_from_slice(&self.rx_l2cap[..alen]);
-            self.handle_att(&att[..alen], result);
+        let n = body.len().min(cap - self.rx_l2cap_len);
+        self.rx_l2cap[self.rx_l2cap_len..self.rx_l2cap_len + n].copy_from_slice(&body[..n]);
+        self.rx_l2cap_len += n;
+        let msg_len = self.rx_l2cap_msg_len.min(cap);
+        if self.rx_l2cap_len >= msg_len {
+            let mut att = [0u8; 256];
+            att[..msg_len].copy_from_slice(&self.rx_l2cap[..msg_len]);
+            self.handle_att(&att[..msg_len], result);
             self.rx_l2cap_len = 0;
         }
     }
@@ -581,7 +636,13 @@ impl Conn {
             return;
         }
         let op = att[0];
-        if self.pending_request && matches!(op, 0x01 | 0x09 | 0x0B | 0x11 | 0x13 | 0x15 | 0x17) {
+        if self.pending_request
+            && matches!(op, 0x01 | 0x03 | 0x09 | 0x0B | 0x11 | 0x13 | 0x15 | 0x17)
+        {
+            if op == 0x03 && att.len() >= 3 {
+                let peer = u16::from_le_bytes([att[1], att[2]]);
+                self.att_mtu = self.att_mtu.min(peer).max(ATT_MTU_DEFAULT as u16);
+            }
             self.pending_request = false;
             let n = att.len().min(self.gatt_result.len());
             self.gatt_result[..n].copy_from_slice(&att[..n]);
@@ -603,7 +664,7 @@ impl Conn {
             0x02 => {
                 let mut rsp = [0u8; 5];
                 rsp[0] = 0x03;
-                rsp[1..3].copy_from_slice(&(ATT_MTU as u16).to_le_bytes());
+                rsp[1..3].copy_from_slice(&self.att_mtu.to_le_bytes());
                 self.queue_att(&rsp);
             }
             0x04 => {
@@ -683,6 +744,21 @@ impl Conn {
                         self.queue_att(&rsp[..1 + vlen]);
                     }
                     None => self.queue_att(&[0x01, 0x0A, 0x00, 0x00, 0x0A]),
+                }
+            }
+            0x0C => {
+                let handle = u16::from_le_bytes([att[1], att[2]]);
+                let offset = u16::from_le_bytes([att[3], att[4]]) as usize;
+                let mut value = [0u8; 32];
+                match self.read(handle, &mut value) {
+                    Some(vlen) if offset < vlen => {
+                        let chunk = &value[offset..vlen];
+                        let mut rsp = [0u8; 32];
+                        rsp[0] = 0x0D;
+                        rsp[1..1 + chunk.len()].copy_from_slice(chunk);
+                        self.queue_att(&rsp[..1 + chunk.len()]);
+                    }
+                    _ => self.queue_att(&[0x01, 0x0C, 0x00, 0x00, 0x0A]),
                 }
             }
             0x10 => {
@@ -822,6 +898,27 @@ impl Conn {
             LL_CONTROL_START_ENC_RSP => {
                 self.encrypted = true;
                 self.packet_counter = 0;
+                Ok(())
+            }
+            LL_CONTROL_LENGTH_REQ => {
+                let max_tx = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+                let max_rx = u16::from_le_bytes([payload[5], payload[6]]) as usize;
+                let mut rsp = [0u8; 19];
+                rsp[0] = LL_CONTROL_LENGTH_RSP;
+                rsp[1..3].copy_from_slice(&(LL_PDU_PAYLOAD_MAX as u16).to_le_bytes());
+                rsp[3..5].copy_from_slice(&2120u16.to_le_bytes());
+                rsp[5..7].copy_from_slice(&(LL_PDU_PAYLOAD_MAX as u16).to_le_bytes());
+                rsp[7..9].copy_from_slice(&2120u16.to_le_bytes());
+                self.pending_control = Some(rsp);
+                self.tx_pdu_max = max_tx.min(LL_PDU_PAYLOAD_MAX);
+                self.rx_pdu_max = max_rx.min(LL_PDU_PAYLOAD_MAX);
+                Ok(())
+            }
+            LL_CONTROL_LENGTH_RSP => {
+                let max_tx = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+                let max_rx = u16::from_le_bytes([payload[5], payload[6]]) as usize;
+                self.tx_pdu_max = max_tx.min(LL_PDU_PAYLOAD_MAX);
+                self.rx_pdu_max = max_rx.min(LL_PDU_PAYLOAD_MAX);
                 Ok(())
             }
             LL_CONTROL_PHY_REQ => {
@@ -1033,9 +1130,9 @@ mod tests {
         unsafe { &*pac::CCM::ptr() }
     }
 
-    fn run_att(conn: &mut Conn, request: &[u8]) -> [u8; 32] {
+    fn run_att(conn: &mut Conn, request: &[u8]) -> [u8; 256] {
         let mut result = ConnEvent::Idle;
-        let mut out = [0u8; 32];
+        let mut out = [0u8; 256];
         let mut att = [0u8; 64];
         att[..request.len()].copy_from_slice(request);
         conn.handle_att(&att[..request.len()], &mut result);
@@ -1242,5 +1339,137 @@ mod gatt_client_tests {
         feed_response(&mut c, &[0x01, 0x0A, 0x05, 0x00, 0x0A]);
         let (op, _, _) = c.gatt_take_result();
         assert_eq!(op, 0x01);
+    }
+}
+
+#[cfg(test)]
+mod data_path_tests {
+    use super::*;
+
+    fn conn() -> Conn {
+        let params = ConnectReqData {
+            access_addr: 0x1234_ABCD,
+            crc_init: 0x654321,
+            win_size: 1,
+            win_offset: 0,
+            interval: 24,
+            latency: 0,
+            timeout: 2000,
+            channel_map: [0xFF, 0xFF, 0xFF, 0xFF, 0x1F],
+            hop: 13,
+            sca: 2,
+        };
+        Conn::new(&params, 37, 0, ConnRole::Slave, ccm_regs())
+    }
+
+    fn ccm_regs() -> &'static pac::ccm::RegisterBlock {
+        unsafe { &*pac::CCM::ptr() }
+    }
+
+    #[test]
+    fn mtu_exchange_negotiates_min() {
+        let mut c = conn();
+        c.gatt_send_request(&[0x02, 0x10, 0x00]);
+        c.handle_att(&[0x03, 0x17, 0x00], &mut ConnEvent::Idle);
+        assert_eq!(c.att_mtu, 23);
+        c.att_mtu = 247;
+        c.gatt_send_request(&[0x02, 0xF7, 0x00]);
+        c.handle_att(&[0x03, 0x27, 0x00], &mut ConnEvent::Idle);
+        assert_eq!(c.att_mtu, 39);
+    }
+
+    #[test]
+    fn long_att_pdu_fragments_across_events() {
+        let mut c = conn();
+        let big = [0x42u8; 60];
+        c.queue_att(&big);
+        // first fragment: 27-4 = 23 ATT bytes with the L2CAP header
+        c.tx_fragment();
+        let buf = c.tx_buf;
+        assert_eq!(buf[0] & 0b11, LLID_DATA_START);
+        assert_eq!(buf[1] as usize, 4 + 23);
+        assert!(c.tx_pending);
+        // continuation: 27 bytes
+        c.tx_fragment();
+        let buf = c.tx_buf;
+        assert_eq!(buf[0] & 0b11, LLID_DATA_CONTINUATION_OR_COMPLETE);
+        assert_eq!(buf[1] as usize, 27);
+        // final: 10 bytes
+        c.tx_fragment();
+        let buf = c.tx_buf;
+        assert_eq!(buf[0] & 0b11, LLID_DATA_CONTINUATION_OR_COMPLETE);
+        assert_eq!(buf[1] as usize, 10);
+        assert!(!c.tx_pending);
+    }
+
+    #[test]
+    fn single_pdu_uses_complete_llid() {
+        let mut c = conn();
+        c.queue_att(&[0x42u8; 10]);
+        c.tx_fragment();
+        let buf = c.tx_buf;
+        assert_eq!(buf[0] & 0b11, LLID_DATA_COMPLETE);
+        assert!(!c.tx_pending);
+    }
+
+    #[test]
+    fn rx_reassembly_across_fragments() {
+        let mut c = conn();
+        let mut result = ConnEvent::Idle;
+        // first fragment: L2CAP header (len 6, ATT cid) + 4 ATT bytes
+        let mut f1 = [0u8; 7];
+        f1[0..2].copy_from_slice(&5u16.to_le_bytes());
+        f1[2..4].copy_from_slice(&L2CAP_ATT_CID.to_le_bytes());
+        f1[4..7].copy_from_slice(&[0x0A, 0x06, 0x00]);
+        c.handle_l2cap(&f1, LLID_DATA_START, &mut result);
+        assert_eq!(c.rx_l2cap_len, 3);
+        // continuation: remaining 2 ATT bytes
+        let f2 = [0x01u8, 0x02];
+        c.handle_l2cap(&f2, LLID_DATA_CONTINUATION_OR_COMPLETE, &mut result);
+        assert_eq!(c.rx_l2cap_len, 0);
+        assert!(c.tx_pending);
+    }
+
+    #[test]
+    fn dle_negotiation_updates_pdu_max() {
+        let mut c = conn();
+        let mut req = [0u8; 9];
+        req[0] = LL_CONTROL_LENGTH_REQ;
+        req[1..3].copy_from_slice(&251u16.to_le_bytes());
+        req[3..5].copy_from_slice(&2120u16.to_le_bytes());
+        req[5..7].copy_from_slice(&251u16.to_le_bytes());
+        req[7..9].copy_from_slice(&2120u16.to_le_bytes());
+        let mut r = Radio::dummy();
+        c.handle_ll_control(&req, &mut r, &BtTimer::dummy())
+            .unwrap();
+        assert_eq!(c.tx_pdu_max, 251);
+        assert!(c.pending_control.is_some());
+    }
+
+    #[test]
+    fn read_blob_serves_offset() {
+        let mut c = conn();
+        c.nus_cccd = 0;
+        let mut out = [0u8; 256];
+        let req = [0x0Cu8, 0x05, 0x00, 0x00, 0x00];
+        let mut result = ConnEvent::Idle;
+        c.handle_att(&req, &mut result);
+        let n = c.tx_att_len;
+        out[..n].copy_from_slice(&c.tx_att[..n]);
+        assert_eq!(out[0], 0x01);
+    }
+}
+
+#[cfg(test)]
+impl Radio {
+    fn dummy() -> Radio {
+        Radio::new(unsafe { pac::Peripherals::steal() }.RADIO)
+    }
+}
+
+#[cfg(test)]
+impl BtTimer {
+    fn dummy() -> BtTimer {
+        BtTimer::new(unsafe { pac::Peripherals::steal() }.TIMER0)
     }
 }
