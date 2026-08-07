@@ -975,6 +975,11 @@ impl Ble {
         }
     }
 
+    /// True when the current connection was initiated by us.
+    pub fn conn_is_master(&self) -> bool {
+        matches!(self.conn.as_ref().map(|c| c.role), Some(ConnRole::Master))
+    }
+
     /// Data written by the peer to the NUS RX characteristic.
     pub fn conn_rx_data(&self) -> &[u8] {
         match &self.conn {
