@@ -33,6 +33,8 @@ pub enum AdvType {
 pub enum FilterPolicy {
     /// Accept all devices (no accept-list filtering).
     AcceptAll,
+    /// Only accept devices present in the accept list.
+    AcceptList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +187,7 @@ pub struct Ble {
     connect_target: Option<[u8; 6]>,
     connect_target_type: AddrType,
     last_radio_channel: Option<u8>,
+    accept_list: crate::ll::accept_list::AcceptList,
     ccm: &'static pac::ccm::RegisterBlock,
     tx_buf: [u8; RX_PDU_MAX],
     tx_pdu_len: usize,
@@ -223,6 +226,7 @@ impl Ble {
             connect_target: None,
             connect_target_type: AddrType::Public,
             last_radio_channel: None,
+            accept_list: crate::ll::accept_list::AcceptList::new(),
             ccm: ccm_regs,
             tx_buf: [0; RX_PDU_MAX],
             tx_pdu_len: 0,
@@ -369,6 +373,21 @@ impl Ble {
             ..Default::default()
         };
         self.gap_scan_start(&params)
+    }
+
+    /// Add a device to the accept list (max 8 entries).
+    pub fn gap_accept_list_add(&mut self, addr: [u8; 6], addr_type: AddrType) -> bool {
+        self.accept_list.add(addr, addr_type)
+    }
+
+    /// Clear the accept list.
+    pub fn gap_accept_list_clear(&mut self) {
+        self.accept_list.clear();
+    }
+
+    /// Number of entries in the accept list.
+    pub fn gap_accept_list_len(&self) -> usize {
+        self.accept_list.len()
     }
 
     /// Start scanning.
@@ -625,6 +644,13 @@ impl Ble {
                             self.send_connect_req(true);
                             return;
                         }
+                    }
+                    if self.scan_params.filter_policy == FilterPolicy::AcceptList
+                        && !self
+                            .accept_list
+                            .contains(addr, BtAddr::parse(addr).addr_type)
+                    {
+                        return;
                     }
                     let mut buf = [0u8; 31];
                     let data_len = data.len().min(31);
