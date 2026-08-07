@@ -12,10 +12,10 @@
 //!   channel PDU codecs, addresses, channel mapping.
 //! - [`gap`] - Generic Access Profile: advertising data (AD) structure
 //!   codec.
-//! - [`hw`] - Hardware layer (enabled with the `nrf52811`, `nrf52832` or
-//!   `nrf52840` feature): RADIO/TIMER0 drivers and the high-level
-//!   [`hw::Ble`] API in the style of the SoftDevice (`gap_adv_start`,
-//!   `gap_adv_stop`, ...).
+//! - [`hw`] - Hardware layer (enabled with the `nrf52811`, `nrf52832`,
+//!   `nrf52833` or `nrf52840` feature): RADIO/TIMER0 drivers and the
+//!   high-level [`hw::Ble`] API in the style of the SoftDevice
+//!   (`gap_adv_start`, `gap_adv_stop`, ...).
 //! - [`sim`] - Host-side virtual radio used for loopback testing without
 //!   hardware (enabled with the `sim` feature).
 //!

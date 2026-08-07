@@ -9,8 +9,8 @@ use super::pac;
 pub enum TxPower {
     /// -40 dBm
     Neg40Dbm,
-    /// -30 dBm (nRF52811, nRF52832)
-    #[cfg(any(feature = "nrf52811", feature = "nrf52832"))]
+    /// -30 dBm (nRF52811, nRF52832, nRF52833)
+    #[cfg(any(feature = "nrf52811", feature = "nrf52832", feature = "nrf52833"))]
     Neg30Dbm,
     /// -20 dBm
     Neg20Dbm,
@@ -28,20 +28,20 @@ pub enum TxPower {
     Pos3Dbm,
     /// +4 dBm
     Pos4Dbm,
-    /// +2 dBm (nRF52840 only)
-    #[cfg(feature = "nrf52840")]
+    /// +2 dBm (nRF52833, nRF52840)
+    #[cfg(any(feature = "nrf52833", feature = "nrf52840"))]
     Pos2Dbm,
-    /// +5 dBm (nRF52840 only)
-    #[cfg(feature = "nrf52840")]
+    /// +5 dBm (nRF52833, nRF52840)
+    #[cfg(any(feature = "nrf52833", feature = "nrf52840"))]
     Pos5Dbm,
-    /// +6 dBm (nRF52840 only)
-    #[cfg(feature = "nrf52840")]
+    /// +6 dBm (nRF52833, nRF52840)
+    #[cfg(any(feature = "nrf52833", feature = "nrf52840"))]
     Pos6Dbm,
-    /// +7 dBm (nRF52840 only)
-    #[cfg(feature = "nrf52840")]
+    /// +7 dBm (nRF52833, nRF52840)
+    #[cfg(any(feature = "nrf52833", feature = "nrf52840"))]
     Pos7Dbm,
-    /// +8 dBm (nRF52840 only)
-    #[cfg(feature = "nrf52840")]
+    /// +8 dBm (nRF52833, nRF52840)
+    #[cfg(any(feature = "nrf52833", feature = "nrf52840"))]
     Pos8Dbm,
 }
 
@@ -113,7 +113,7 @@ impl Radio {
             let w = w.txpower();
             match power {
                 TxPower::Neg40Dbm => w.neg40d_bm(),
-                #[cfg(feature = "nrf52811")]
+                #[cfg(any(feature = "nrf52811", feature = "nrf52833"))]
                 TxPower::Neg30Dbm => w.neg30d_bm(),
                 #[cfg(feature = "nrf52832")]
                 TxPower::Neg30Dbm => unsafe { w.bits(0xE2) },
@@ -125,15 +125,15 @@ impl Radio {
                 TxPower::ZeroDbm => w._0d_bm(),
                 TxPower::Pos3Dbm => w.pos3d_bm(),
                 TxPower::Pos4Dbm => w.pos4d_bm(),
-                #[cfg(feature = "nrf52840")]
+                #[cfg(any(feature = "nrf52833", feature = "nrf52840"))]
                 TxPower::Pos2Dbm => w.pos2d_bm(),
-                #[cfg(feature = "nrf52840")]
+                #[cfg(any(feature = "nrf52833", feature = "nrf52840"))]
                 TxPower::Pos5Dbm => w.pos5d_bm(),
-                #[cfg(feature = "nrf52840")]
+                #[cfg(any(feature = "nrf52833", feature = "nrf52840"))]
                 TxPower::Pos6Dbm => w.pos6d_bm(),
-                #[cfg(feature = "nrf52840")]
+                #[cfg(any(feature = "nrf52833", feature = "nrf52840"))]
                 TxPower::Pos7Dbm => w.pos7d_bm(),
-                #[cfg(feature = "nrf52840")]
+                #[cfg(any(feature = "nrf52833", feature = "nrf52840"))]
                 TxPower::Pos8Dbm => w.pos8d_bm(),
             }
         });

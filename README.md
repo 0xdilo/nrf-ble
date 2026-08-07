@@ -1,8 +1,8 @@
 # nrf-ble
 
 An open-source Bluetooth Low Energy stack for Nordic nRF52 microcontrollers
-(nRF52832, nRF52840), written from scratch in Rust as a **SoftDevice-free**
-replacement for Nordic's proprietary BLE stack.
+(nRF52811, nRF52832, nRF52833, nRF52840), written from scratch in Rust as a
+**SoftDevice-free** replacement for Nordic's proprietary BLE stack.
 
 No Nordic SoftDevice binary, headers or code are used: everything is
 implemented from the public Bluetooth Core Specification and the public
@@ -19,7 +19,8 @@ This is the foundation release. Working and tested (without hardware):
 - **GAP**: advertising data (AD structure) codec.
 - **Radio driver**: nRF52 RADIO peripheral configured for BLE 1 Mbit/s
   (packet framing, access address, 24-bit CRC, whitening), channel and TX
-  power control, blocking TX / non-blocking RX.
+  power control, blocking TX / non-blocking RX. Register-exact on silicon
+  (nRF52811).
 - **Stack API**: SoftDevice-style API (`gap_adv_start`, `gap_adv_stop`,
   `gap_scan_start`, `gap_scan_stop`, events) with an advertising and
   scanning scheduler on TIMER0, including scan-request/scan-response
@@ -118,6 +119,7 @@ rustup target add thumbv7em-none-eabihf
 cargo check --target thumbv7em-none-eabihf --features nrf52832
 cargo check --target thumbv7em-none-eabihf --no-default-features --features nrf52840
 cargo check --target thumbv7em-none-eabihf --no-default-features --features nrf52811
+cargo check --target thumbv7em-none-eabihf --no-default-features --features nrf52833
 ```
 
 On-device test (`examples/hwtest`, nRF52811):
