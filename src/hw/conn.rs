@@ -4,7 +4,14 @@
 use crate::ll::pdu::{ConnectReqData, DataPdu, LLID_CONTROL, LLID_DATA_COMPLETE};
 use crate::Error;
 
+use super::ccm::{Ccm, LL_MIC_LEN, LL_NONCE_MASTER_TO_SLAVE, LL_NONCE_SLAVE_TO_MASTER};
+use super::pac;
 use super::radio::Radio;
+use super::smp::{
+    Smp, L2CAP_SMP_CID, SMP_ENCRYPTION_INFORMATION, SMP_MASTER_IDENTIFICATION, SMP_PAIRING_CONFIRM,
+    SMP_PAIRING_FAILED, SMP_PAIRING_RANDOM, SMP_PAIRING_REQUEST, SMP_PAIRING_RESPONSE,
+    SMP_SECURITY_REQUEST,
+};
 use super::timers::{timeout_ticks, BtTimer, IntervalAccum};
 
 /// LL Control PDU opcode: LL_VERSION_IND.
@@ -15,6 +22,14 @@ pub const LL_CONTROL_FEATURE_REQ: u8 = 0x1D;
 pub const LL_CONTROL_FEATURE_RSP: u8 = 0x1E;
 /// LL Control PDU opcode: LL_TERMINATE_IND.
 pub const LL_CONTROL_TERMINATE_IND: u8 = 0x02;
+pub const LL_CONTROL_CONNECTION_UPDATE_REQ: u8 = 0x00;
+pub const LL_CONTROL_CONNECTION_UPDATE_RSP: u8 = 0x01;
+pub const LL_CONTROL_ENCRYPT_REQ: u8 = 0x07;
+pub const LL_CONTROL_ENCRYPT_RSP: u8 = 0x08;
+pub const LL_CONTROL_START_ENC_REQ: u8 = 0x09;
+pub const LL_CONTROL_START_ENC_RSP: u8 = 0x0A;
+pub const LL_CONTROL_PHY_REQ: u8 = 0x0E;
+pub const LL_CONTROL_PHY_RSP: u8 = 0x0F;
 
 /// L2CAP channel ID for the ATT protocol.
 pub const L2CAP_ATT_CID: u16 = 0x0004;
@@ -80,6 +95,19 @@ pub struct Conn {
     pub rx_data_len: usize,
     tx_buf: [u8; 64],
     rx_buf: [u8; 64],
+    event_counter: u16,
+    pending_update: Option<(u16, u16)>,
+    pending_update_instant: u16,
+    pending_request: bool,
+    pub smp: Smp,
+    pub encrypted: bool,
+    packet_counter: u64,
+    ccm: Ccm,
+    want_encrypt: bool,
+    pairing_in_progress: bool,
+    pending_control: Option<[u8; 19]>,
+    gatt_result: [u8; 64],
+    gatt_result_len: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +124,13 @@ pub enum DisconnectReason {
 }
 
 impl Conn {
-    pub fn new(params: &ConnectReqData, first_channel: u8, now: u32, role: ConnRole) -> Conn {
+    pub fn new(
+        params: &ConnectReqData,
+        first_channel: u8,
+        now: u32,
+        role: ConnRole,
+        ccm: &'static pac::ccm::RegisterBlock,
+    ) -> Conn {
         let anchor = match role {
             ConnRole::Master => now.wrapping_add(timeout_ticks(200)),
             ConnRole::Slave => now,
@@ -127,6 +161,19 @@ impl Conn {
             rx_data_len: 0,
             tx_buf: [0; 64],
             rx_buf: [0; 64],
+            event_counter: 0,
+            pending_update: None,
+            pending_update_instant: 0,
+            pending_request: false,
+            smp: Smp::new(),
+            encrypted: false,
+            packet_counter: 0,
+            ccm: Ccm::new(ccm),
+            want_encrypt: false,
+            pairing_in_progress: false,
+            pending_control: None,
+            gatt_result: [0; 64],
+            gatt_result_len: 0,
         }
     }
 
@@ -146,6 +193,17 @@ impl Conn {
     }
 
     pub fn event(&mut self, radio: &Radio, timer: &BtTimer) -> Result<ConnEvent, Error> {
+        self.event_counter = self.event_counter.wrapping_add(1);
+        if self.encrypted {
+            self.packet_counter = self.packet_counter.wrapping_add(1);
+        }
+        if let Some((interval, timeout)) = self.pending_update {
+            if self.event_counter == self.pending_update_instant {
+                self.interval = interval;
+                self.timeout = timeout;
+                self.accum = IntervalAccum::new_125ms();
+            }
+        }
         let ticks = self.accum.next(self.interval);
         self.anchor = self.anchor.wrapping_add(ticks);
         self.channel = next_channel(self.channel, self.hop, &self.channel_map);
@@ -168,6 +226,10 @@ impl Conn {
         loop {
             match radio.receive_poll(&self.rx_buf) {
                 Ok(Some(len)) => {
+                    if !self.rx(len) {
+                        radio.receive_cancel();
+                        break;
+                    }
                     received = true;
                     match DataPdu::decode(&self.rx_buf[..len]) {
                         Ok(pdu) => {
@@ -214,7 +276,7 @@ impl Conn {
                         self.nesn = pdu_sn;
                     }
                     match self.handle_ll_control(&payload[..plen], radio, timer) {
-                        Ok(()) => {}
+                        Ok(()) => result = ConnEvent::Control(payload[0]),
                         Err(reason) => {
                             return Ok(ConnEvent::Disconnected(reason));
                         }
@@ -225,7 +287,9 @@ impl Conn {
                     if new_data {
                         self.nesn = pdu_sn;
                     }
+                    let before = self.rx_data_len;
                     self.handle_l2cap(&payload[..plen], new_data, &mut result);
+                    let _ = before;
                 }
             }
         }
@@ -263,6 +327,10 @@ impl Conn {
         loop {
             match radio.receive_poll(&self.rx_buf) {
                 Ok(Some(len)) => {
+                    if !self.rx(len) {
+                        radio.receive_cancel();
+                        break;
+                    }
                     self.last_rx = timer.now();
                     if let Ok(pdu) = DataPdu::decode(&self.rx_buf[..len]) {
                         let plen = pdu.payload.len().min(64);
@@ -271,14 +339,14 @@ impl Conn {
                             self.nesn = pdu.sn;
                         }
                         if plen > 0 {
-                            if pdu.llid == LLID_CONTROL
-                                && pdu.payload.first() == Some(&LL_CONTROL_TERMINATE_IND)
-                            {
-                                return Ok(ConnEvent::Disconnected(
-                                    DisconnectReason::RemoteTerminate,
-                                ));
-                            }
-                            if pdu.llid != LLID_CONTROL {
+                            if pdu.llid == LLID_CONTROL {
+                                if pdu.payload.first() == Some(&LL_CONTROL_TERMINATE_IND) {
+                                    return Ok(ConnEvent::Disconnected(
+                                        DisconnectReason::RemoteTerminate,
+                                    ));
+                                }
+                                result = ConnEvent::Control(payload[0]);
+                            } else {
                                 self.handle_l2cap(&payload[..plen], true, &mut result);
                             }
                         }
@@ -300,15 +368,65 @@ impl Conn {
         Ok(result)
     }
 
+    fn tx(&mut self, radio: &Radio, len: usize) {
+        if self.encrypted {
+            let direction = match self.role {
+                ConnRole::Master => LL_NONCE_MASTER_TO_SLAVE,
+                ConnRole::Slave => LL_NONCE_SLAVE_TO_MASTER,
+            };
+            self.ccm
+                .setup(&self.smp.stk, self.packet_counter, direction);
+            if self.ccm.process(false, &mut self.tx_buf, len).is_err() {
+                return;
+            }
+            radio.transmit(&self.tx_buf[..len + LL_MIC_LEN]);
+        } else {
+            radio.transmit(&self.tx_buf[..len]);
+        }
+    }
+
+    fn rx(&mut self, len: usize) -> bool {
+        if !self.encrypted {
+            return true;
+        }
+        let direction = match self.role {
+            ConnRole::Master => LL_NONCE_SLAVE_TO_MASTER,
+            ConnRole::Slave => LL_NONCE_MASTER_TO_SLAVE,
+        };
+        self.ccm
+            .setup(&self.smp.stk, self.packet_counter, direction);
+        self.ccm.process(true, &mut self.rx_buf, len).is_ok()
+    }
+
     fn respond(&mut self, radio: &Radio, timer: &BtTimer) {
-        let header = |buf: &mut [u8; 64], nesn: bool, sn: bool, len: u8| {
-            buf[0] = (LLID_DATA_COMPLETE & 0b11) | ((nesn as u8) << 2) | ((sn as u8) << 3);
+        let header = |buf: &mut [u8; 64], llid: u8, nesn: bool, sn: bool, len: u8| {
+            buf[0] = (llid & 0b11) | ((nesn as u8) << 2) | ((sn as u8) << 3);
             buf[1] = len;
         };
+        if let Some(ctrl) = self.pending_control.take() {
+            let plen: usize = 18;
+            header(
+                &mut self.tx_buf,
+                LLID_CONTROL,
+                !self.nesn,
+                self.sn,
+                plen as u8,
+            );
+            self.tx_buf[2..2 + plen].copy_from_slice(&ctrl[..plen]);
+            let _ = timer;
+            self.tx(radio, 2 + plen);
+            return;
+        }
         if self.tx_pending {
             let att = &self.tx_att[..self.tx_att_len];
             let payload_len = att.len() + 4;
-            header(&mut self.tx_buf, !self.nesn, self.sn, payload_len as u8);
+            header(
+                &mut self.tx_buf,
+                LLID_DATA_COMPLETE,
+                !self.nesn,
+                self.sn,
+                payload_len as u8,
+            );
             self.tx_buf[2..4].copy_from_slice(&(att.len() as u16).to_le_bytes());
             self.tx_buf[4..6].copy_from_slice(&L2CAP_ATT_CID.to_le_bytes());
             self.tx_buf[6..6 + att.len()].copy_from_slice(att);
@@ -316,11 +434,116 @@ impl Conn {
             self.sn = !self.sn;
             self.tx_pending = false;
             let _ = timer;
-            radio.transmit(&self.tx_buf[..total]);
+            self.tx(radio, total);
         } else {
-            header(&mut self.tx_buf, !self.nesn, self.sn, 0);
-            radio.transmit(&self.tx_buf[..2]);
+            header(&mut self.tx_buf, LLID_DATA_COMPLETE, !self.nesn, self.sn, 0);
+            self.tx(radio, 2);
         }
+    }
+
+    fn handle_smp(&mut self, body: &[u8], _result: &mut ConnEvent) {
+        if body.is_empty() {
+            return;
+        }
+        let op = body[0];
+        let mut out = [0u8; 17];
+        let mut out_len = 0;
+        let mut complete = false;
+        match op {
+            SMP_PAIRING_FAILED => {
+                self.pairing_in_progress = false;
+                return;
+            }
+            SMP_ENCRYPTION_INFORMATION | SMP_MASTER_IDENTIFICATION => {
+                if self.role == ConnRole::Slave {
+                    let _ = op;
+                }
+            }
+            SMP_SECURITY_REQUEST => {
+                let mut req = [0u8; 7];
+                req.copy_from_slice(&self.smp.build_pairing_request());
+                let mut l2 = [0u8; 11];
+                l2[0..2].copy_from_slice(&7u16.to_le_bytes());
+                l2[2..4].copy_from_slice(&L2CAP_SMP_CID.to_le_bytes());
+                l2[4..11].copy_from_slice(&req);
+                self.queue_l2cap(&l2);
+                return;
+            }
+            SMP_PAIRING_REQUEST => {
+                if let Ok(rsp) = self.smp.handle_pairing_request(&body[..body.len().min(7)]) {
+                    out[..7].copy_from_slice(&rsp);
+                    out_len = 7;
+                    self.pairing_in_progress = true;
+                }
+            }
+            SMP_PAIRING_RESPONSE => {
+                if self
+                    .smp
+                    .handle_pairing_response(&body[..body.len().min(7)])
+                    .is_ok()
+                {
+                    self.pairing_in_progress = true;
+                }
+            }
+            SMP_PAIRING_CONFIRM => {
+                if self.smp.handle_confirm(&body[..body.len().min(17)]).is_ok() {
+                    let iat = self.smp.iat;
+                    let ia = self.smp.ia;
+                    let ra = self.smp.ra;
+                    out = self.smp.build_confirm(iat, &ia, &ra);
+                    out_len = 17;
+                }
+            }
+            SMP_PAIRING_RANDOM => match self.smp.handle_random(&body[..body.len().min(17)]) {
+                Ok(rnd) => {
+                    out[..17].copy_from_slice(&rnd);
+                    out_len = 17;
+                    complete = true;
+                }
+                Err(_) => {
+                    let reason = self.smp.pairing_failed;
+                    let failed = self.smp.build_failed(reason);
+                    let mut l2 = [0u8; 6];
+                    l2[0..2].copy_from_slice(&2u16.to_le_bytes());
+                    l2[2..4].copy_from_slice(&L2CAP_SMP_CID.to_le_bytes());
+                    l2[4..6].copy_from_slice(&failed);
+                    self.queue_l2cap(&l2);
+                    self.pairing_in_progress = false;
+                    return;
+                }
+            },
+            _ => {}
+        }
+        if out_len > 0 {
+            let mut l2 = [0u8; 21];
+            l2[0..2].copy_from_slice(&(out_len as u16).to_le_bytes());
+            l2[2..4].copy_from_slice(&L2CAP_SMP_CID.to_le_bytes());
+            l2[4..4 + out_len].copy_from_slice(&out[..out_len]);
+            self.queue_l2cap(&l2[..4 + out_len]);
+        }
+        if complete {
+            self.pairing_in_progress = false;
+            if self.role == ConnRole::Master {
+                self.queue_encrypt_req();
+            }
+        }
+    }
+
+    pub fn queue_l2cap(&mut self, l2: &[u8]) {
+        let n = l2.len().min(self.tx_att.len());
+        self.tx_att[..n].copy_from_slice(&l2[..n]);
+        self.tx_att_len = n;
+        self.tx_pending = true;
+    }
+
+    fn queue_encrypt_req(&mut self) {
+        let mut ctrl = [0u8; 19];
+        ctrl[0] = LL_CONTROL_ENCRYPT_REQ;
+        ctrl[1..9].fill(0);
+        ctrl[9..11].fill(0);
+        ctrl[11..19].fill(0);
+        self.pending_control = Some(ctrl);
+        self.want_encrypt = true;
     }
 
     fn handle_l2cap(&mut self, payload: &[u8], new_data: bool, result: &mut ConnEvent) {
@@ -329,7 +552,13 @@ impl Conn {
         }
         let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
         let cid = u16::from_le_bytes([payload[2], payload[3]]);
+        if cid == L2CAP_SMP_CID {
+            let body = &payload[4..];
+            self.handle_smp(body, result);
+            return;
+        }
         if cid != L2CAP_ATT_CID {
+            *result = ConnEvent::L2cap(cid);
             return;
         }
         let body = &payload[4..];
@@ -352,6 +581,24 @@ impl Conn {
             return;
         }
         let op = att[0];
+        if self.pending_request && matches!(op, 0x01 | 0x09 | 0x0B | 0x11 | 0x13 | 0x15 | 0x17) {
+            self.pending_request = false;
+            let n = att.len().min(self.gatt_result.len());
+            self.gatt_result[..n].copy_from_slice(&att[..n]);
+            self.gatt_result_len = n;
+            return;
+        }
+        if op == 0x1B {
+            let mut buf = [0u8; 20];
+            let handle = u16::from_le_bytes([att[1], att[2]]);
+            let n = (att.len() - 3).min(20);
+            buf[..n].copy_from_slice(&att[3..3 + n]);
+            self.rx_data[..n].copy_from_slice(&buf[..n]);
+            self.rx_data_len = n;
+            let _ = handle;
+            *result = ConnEvent::Data;
+            return;
+        }
         match op {
             0x02 => {
                 let mut rsp = [0u8; 5];
@@ -487,6 +734,21 @@ impl Conn {
         }
     }
 
+    pub fn gatt_send_request(&mut self, att: &[u8]) {
+        self.queue_att(att);
+        self.pending_request = true;
+    }
+
+    pub fn gatt_take_result(&mut self) -> (u8, [u8; 64], usize) {
+        let op = self.gatt_result[0];
+        let len = self.gatt_result_len;
+        let mut buf = self.gatt_result;
+        self.gatt_result_len = 0;
+        self.gatt_result[0] = 0;
+        buf[0] = op;
+        (op, buf, len)
+    }
+
     fn queue_att(&mut self, att: &[u8]) {
         let len = att.len().min(self.tx_att.len());
         self.tx_att[..len].copy_from_slice(&att[..len]);
@@ -528,6 +790,64 @@ impl Conn {
                 self.tx_buf[2] = LL_CONTROL_FEATURE_RSP;
                 self.tx_buf[3..11].fill(0);
                 radio.transmit(&self.tx_buf[..11]);
+                Ok(())
+            }
+            LL_CONTROL_ENCRYPT_REQ => {
+                let mut rsp = [0u8; 19];
+                rsp[0] = LL_CONTROL_ENCRYPT_RSP;
+                rsp[1..9].fill(0);
+                rsp[9..11].fill(0);
+                rsp[11..19].fill(0);
+                self.pending_control = Some(rsp);
+                self.want_encrypt = true;
+                Ok(())
+            }
+            LL_CONTROL_ENCRYPT_RSP => {
+                let mut req = [0u8; 19];
+                req[0] = LL_CONTROL_START_ENC_REQ;
+                self.pending_control = Some(req);
+                Ok(())
+            }
+            LL_CONTROL_START_ENC_REQ => {
+                self.tx_buf[0] =
+                    (LLID_CONTROL & 0b11) | ((!self.nesn as u8) << 2) | ((self.sn as u8) << 3);
+                self.tx_buf[1] = 1;
+                self.tx_buf[2] = LL_CONTROL_START_ENC_RSP;
+                self.tx_buf[3] = 0;
+                self.tx(radio, 3);
+                self.encrypted = true;
+                self.packet_counter = 0;
+                Ok(())
+            }
+            LL_CONTROL_START_ENC_RSP => {
+                self.encrypted = true;
+                self.packet_counter = 0;
+                Ok(())
+            }
+            LL_CONTROL_PHY_REQ => {
+                let mut rsp = [0u8; 19];
+                rsp[0] = LL_CONTROL_PHY_RSP;
+                rsp[1] = 0;
+                rsp[2] = 0x01;
+                rsp[3] = 0x01;
+                rsp[4] = 0x01;
+                self.pending_control = Some(rsp);
+                Ok(())
+            }
+            LL_CONTROL_CONNECTION_UPDATE_REQ => {
+                if payload.len() >= 10 {
+                    let interval = u16::from_le_bytes([payload[3], payload[4]]);
+                    let timeout = u16::from_le_bytes([payload[7], payload[8]]);
+                    let instant = u16::from_le_bytes([payload[9], payload[10]]);
+                    self.tx_buf[0] =
+                        (LLID_CONTROL & 0b11) | ((!self.nesn as u8) << 2) | ((self.sn as u8) << 3);
+                    self.tx_buf[1] = 2;
+                    self.tx_buf[2] = LL_CONTROL_CONNECTION_UPDATE_RSP;
+                    self.tx_buf[3] = 0;
+                    radio.transmit(&self.tx_buf[..4]);
+                    self.pending_update = Some((interval, timeout));
+                    self.pending_update_instant = instant;
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -650,6 +970,10 @@ pub enum ConnEvent {
     Idle,
     /// The peer wrote data (see `rx_data`).
     Data,
+    /// The peer sent an LL control PDU (opcode).
+    Control(u8),
+    /// The peer sent an L2CAP PDU on a non-ATT channel.
+    L2cap(u16),
     /// The link ended.
     Disconnected(DisconnectReason),
 }
@@ -702,7 +1026,11 @@ mod tests {
             hop: 13,
             sca: 2,
         };
-        Conn::new(&params, 37, 0, ConnRole::Slave)
+        Conn::new(&params, 37, 0, ConnRole::Slave, ccm_regs())
+    }
+
+    fn ccm_regs() -> &'static pac::ccm::RegisterBlock {
+        unsafe { &*pac::CCM::ptr() }
     }
 
     fn run_att(conn: &mut Conn, request: &[u8]) -> [u8; 32] {
@@ -810,5 +1138,109 @@ mod tests {
         let mut c = conn();
         c.terminate();
         assert!(c.terminate_pending);
+    }
+}
+
+#[cfg(test)]
+mod gatt_client_tests {
+    use super::*;
+
+    fn conn() -> Conn {
+        let params = ConnectReqData {
+            access_addr: 0x1234_ABCD,
+            crc_init: 0x654321,
+            win_size: 1,
+            win_offset: 0,
+            interval: 24,
+            latency: 0,
+            timeout: 2000,
+            channel_map: [0xFF, 0xFF, 0xFF, 0xFF, 0x1F],
+            hop: 13,
+            sca: 2,
+        };
+        Conn::new(&params, 37, 0, ConnRole::Master, ccm_regs())
+    }
+
+    fn ccm_regs() -> &'static pac::ccm::RegisterBlock {
+        unsafe { &*pac::CCM::ptr() }
+    }
+
+    fn client_request(conn: &mut Conn, f: impl FnOnce(&mut Conn)) -> [u8; 32] {
+        f(conn);
+        let mut out = [0u8; 32];
+        let n = conn.tx_att_len;
+        out[..n].copy_from_slice(&conn.tx_att[..n]);
+        out
+    }
+
+    fn feed_response(conn: &mut Conn, rsp: &[u8]) {
+        let mut result = ConnEvent::Idle;
+        conn.handle_att(rsp, &mut result);
+    }
+
+    #[test]
+    fn discover_primary_services_request() {
+        let mut c = conn();
+        let req = client_request(&mut c, |c| {
+            c.gatt_send_request(&[0x10, 0x00, 0x28, 0x01, 0x00, 0xFF, 0xFF])
+        });
+        assert_eq!(&req[..7], &[0x10, 0x00, 0x28, 0x01, 0x00, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn read_request_format() {
+        let mut c = conn();
+        let req = client_request(&mut c, |c| c.gatt_send_request(&[0x0A, 0x05, 0x00]));
+        assert_eq!(&req[..3], &[0x0A, 0x05, 0x00]);
+    }
+
+    #[test]
+    fn write_request_format() {
+        let mut c = conn();
+        let req = client_request(&mut c, |c| {
+            let mut r = [0u8; 23];
+            r[0] = 0x12;
+            r[1..3].copy_from_slice(&0x0003u16.to_le_bytes());
+            r[3..5].copy_from_slice(b"hi");
+            c.gatt_send_request(&r[..5]);
+        });
+        assert_eq!(&req[..5], &[0x12, 0x03, 0x00, b'h', b'i']);
+    }
+
+    #[test]
+    fn response_routing_stores_result() {
+        let mut c = conn();
+        c.gatt_send_request(&[0x10, 0x00, 0x28, 0x01, 0x00, 0xFF, 0xFF]);
+        feed_response(&mut c, &[0x11, 18, 0x01, 0x00, 0x9E, 0xCA, 0xDC, 0x24]);
+        let (op, buf, len) = c.gatt_take_result();
+        assert_eq!(op, 0x11);
+        assert_eq!(&buf[..len], &[0x11, 18, 0x01, 0x00, 0x9E, 0xCA, 0xDC, 0x24]);
+    }
+
+    #[test]
+    fn notification_routed_as_data() {
+        let mut c = conn();
+        let mut result = ConnEvent::Idle;
+        c.handle_att(&[0x1B, 0x05, 0x00, b'n', b'o', b't'], &mut result);
+        assert_eq!(result, ConnEvent::Data);
+        assert_eq!(&c.rx_data[..3], b"not");
+    }
+
+    #[test]
+    fn response_clears_pending() {
+        let mut c = conn();
+        c.gatt_send_request(&[0x0A, 0x05, 0x00]);
+        assert!(c.pending_request);
+        feed_response(&mut c, &[0x0B, 0x01, 0x02, 0x03]);
+        assert!(!c.pending_request);
+    }
+
+    #[test]
+    fn error_response_routed() {
+        let mut c = conn();
+        c.gatt_send_request(&[0x0A, 0x05, 0x00]);
+        feed_response(&mut c, &[0x01, 0x0A, 0x05, 0x00, 0x0A]);
+        let (op, _, _) = c.gatt_take_result();
+        assert_eq!(op, 0x01);
     }
 }

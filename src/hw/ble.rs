@@ -127,6 +127,10 @@ pub enum BleEvent {
     },
     /// The peer wrote data to the NUS RX characteristic.
     ConnData,
+    /// The peer sent an LL control PDU (opcode).
+    LlControl(u8),
+    /// The peer sent an L2CAP PDU on a non-ATT channel (channel ID).
+    L2cap(u16),
     /// An advertising or scan response packet was received while scanning.
     ScanReport {
         /// Advertiser address.
@@ -181,6 +185,7 @@ pub struct Ble {
     connect_target: Option<[u8; 6]>,
     connect_target_type: AddrType,
     last_radio_channel: Option<u8>,
+    ccm: &'static pac::ccm::RegisterBlock,
     tx_buf: [u8; RX_PDU_MAX],
     tx_pdu_len: usize,
     rx_buf: [u8; RX_PDU_MAX],
@@ -193,7 +198,9 @@ pub struct Ble {
 impl Ble {
     /// Create a BLE stack instance, taking ownership of the RADIO and
     /// TIMER0 peripherals.
-    pub fn new(radio: pac::RADIO, timer0: pac::TIMER0) -> Self {
+    pub fn new(radio: pac::RADIO, timer0: pac::TIMER0, ccm: pac::CCM) -> Self {
+        let ccm_regs: &'static pac::ccm::RegisterBlock = unsafe { &*pac::CCM::ptr() };
+        let _ = ccm;
         let ble = Ble {
             radio: Radio::new(radio),
             timer: BtTimer::new(timer0),
@@ -216,6 +223,7 @@ impl Ble {
             connect_target: None,
             connect_target_type: AddrType::Public,
             last_radio_channel: None,
+            ccm: ccm_regs,
             tx_buf: [0; RX_PDU_MAX],
             tx_pdu_len: 0,
             rx_buf: [0; RX_PDU_MAX],
@@ -567,7 +575,7 @@ impl Ble {
                 if let Ok(params) = ConnectReqData::decode(ll_data) {
                     let init = *init_addr;
                     let now = self.timer.now();
-                    self.conn = Some(Conn::new(&params, channel, now, ConnRole::Slave));
+                    self.conn = Some(Conn::new(&params, channel, now, ConnRole::Slave, self.ccm));
                     self.adv_state = AdvState::Idle;
                     self.push_event(BleEvent::Connected { conn: params });
                     self.push_event(BleEvent::ConnectReqReceived {
@@ -684,7 +692,7 @@ impl Ble {
         self.connect_target = None;
         let now = self.timer.now();
         let channel = self.radio_last_channel().unwrap_or(37);
-        self.conn = Some(Conn::new(&ll, channel, now, ConnRole::Master));
+        self.conn = Some(Conn::new(&ll, channel, now, ConnRole::Master, self.ccm));
         self.scan_state = ScanState::Idle;
         self.push_event(BleEvent::Connected { conn: ll });
         let _ = scannable;
@@ -749,50 +757,63 @@ impl Ble {
         }
     }
 
+    /// Drive one connection event. Returns `false` once the link closed
+    /// (a `Disconnected` event is queued).
+    pub fn conn_tick(&mut self) -> bool {
+        let (outcome, outcome_raw) = if let Some(conn) = &mut self.conn {
+            let timeout = conn.timeout;
+            let now = self.timer.now();
+            let elapsed = now.wrapping_sub(conn.last_rx);
+            let limit = u32::from(timeout) * 313;
+            if elapsed >= limit {
+                (Some(DisconnectReason::SupervisionTimeout), None)
+            } else {
+                match conn.event(&self.radio, &self.timer) {
+                    Ok(ConnEvent::Disconnected(reason)) => (Some(reason), None),
+                    Ok(other) => (None, Some(other)),
+                    Err(_) => (Some(DisconnectReason::LocalError), None),
+                }
+            }
+        } else {
+            (Some(DisconnectReason::LocalError), None)
+        };
+        if let Some(reason) = outcome {
+            self.conn = None;
+            self.radio.init();
+            self.push_event(BleEvent::Disconnected { reason });
+            return false;
+        }
+        match outcome_raw {
+            Some(ConnEvent::Control(op)) => {
+                self.push_event(BleEvent::LlControl(op));
+            }
+            Some(ConnEvent::L2cap(cid)) => {
+                self.push_event(BleEvent::L2cap(cid));
+            }
+            _ => {}
+        }
+        let has_data = self.conn.as_ref().is_some_and(|c| c.rx_data_len > 0);
+        if has_data {
+            if let Some(conn) = &mut self.conn {
+                conn.rx_data_len = 0;
+            }
+            self.push_event(BleEvent::ConnData);
+        }
+        true
+    }
+
     /// Drive the connection: run until the link is closed.
     ///
     /// The callback receives connection events; when `ConnData` is reported,
     /// the peer's write can be read via [`Ble::conn_rx_data`].
     pub fn conn_forever(&mut self, mut on_event: impl FnMut(&mut Self, BleEvent)) {
-        loop {
-            let outcome = if let Some(conn) = &mut self.conn {
-                let timeout = conn.timeout;
-                let now = self.timer.now();
-                let elapsed = now.wrapping_sub(conn.last_rx);
-                let limit = u32::from(timeout) * 313;
-                if elapsed >= limit {
-                    Some(DisconnectReason::SupervisionTimeout)
-                } else {
-                    match conn.event(&self.radio, &self.timer) {
-                        Ok(ConnEvent::Disconnected(reason)) => Some(reason),
-                        _ => None,
-                    }
-                }
-            } else {
-                Some(DisconnectReason::LocalError)
-            };
-            let has_data = self.conn.as_ref().is_some_and(|c| c.rx_data_len > 0);
-            if let Some(reason) = outcome {
-                self.conn = None;
-                self.radio.init();
-                self.push_event(BleEvent::Disconnected { reason });
-                while let Some(evt) = self.next_event() {
-                    on_event(self, evt);
-                }
-                break;
-            }
+        while self.conn_tick() {
             while let Some(evt) = self.next_event() {
                 on_event(self, evt);
             }
-            if has_data {
-                if let Some(conn) = &mut self.conn {
-                    conn.rx_data_len = 0;
-                }
-                self.push_event(BleEvent::ConnData);
-                while let Some(evt) = self.next_event() {
-                    on_event(self, evt);
-                }
-            }
+        }
+        while let Some(evt) = self.next_event() {
+            on_event(self, evt);
         }
     }
 
@@ -809,6 +830,94 @@ impl Ble {
         match &mut self.conn {
             Some(conn) => conn.queue_notify(data),
             None => Err(Error::NotRunning),
+        }
+    }
+
+    /// Start legacy Just Works pairing (master role: send the SMP pairing
+    /// request; slave role: respond to the peer's request automatically).
+    pub fn gap_pair(&mut self) -> Result<(), Error> {
+        let conn = self.conn.as_mut().ok_or(Error::NotRunning)?;
+        if conn.role == ConnRole::Master {
+            let mut req = [0u8; 7];
+            req.copy_from_slice(&conn.smp.build_pairing_request());
+            let mut l2 = [0u8; 11];
+            l2[0..2].copy_from_slice(&7u16.to_le_bytes());
+            l2[2..4].copy_from_slice(&super::smp::L2CAP_SMP_CID.to_le_bytes());
+            l2[4..11].copy_from_slice(&req);
+            conn.queue_l2cap(&l2);
+        } else {
+            conn.smp.state = super::smp::SmpState::Idle;
+        }
+        Ok(())
+    }
+
+    /// GATT client: discover primary services (READ_BY_GROUP_TYPE, 0x2800).
+    pub fn gatt_discover_primary_services(&mut self) -> Result<(), Error> {
+        let conn = self.conn.as_mut().ok_or(Error::NotRunning)?;
+        let mut req = [0u8; 7];
+        req[0] = 0x10;
+        req[1..3].copy_from_slice(&0x2800u16.to_le_bytes());
+        req[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+        req[5..7].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        conn.gatt_send_request(&req);
+        Ok(())
+    }
+
+    /// GATT client: discover characteristics within a handle range.
+    pub fn gatt_discover_characteristics(&mut self, start: u16, end: u16) -> Result<(), Error> {
+        let conn = self.conn.as_mut().ok_or(Error::NotRunning)?;
+        let mut req = [0u8; 7];
+        req[0] = 0x08;
+        req[1..3].copy_from_slice(&0x2803u16.to_le_bytes());
+        req[3..5].copy_from_slice(&start.to_le_bytes());
+        req[5..7].copy_from_slice(&end.to_le_bytes());
+        conn.gatt_send_request(&req);
+        Ok(())
+    }
+
+    /// GATT client: read an attribute value.
+    pub fn gatt_read(&mut self, handle: u16) -> Result<(), Error> {
+        let conn = self.conn.as_mut().ok_or(Error::NotRunning)?;
+        let mut req = [0u8; 3];
+        req[0] = 0x0A;
+        req[1..3].copy_from_slice(&handle.to_le_bytes());
+        conn.gatt_send_request(&req);
+        Ok(())
+    }
+
+    /// GATT client: write an attribute value (with response).
+    pub fn gatt_write(&mut self, handle: u16, data: &[u8]) -> Result<(), Error> {
+        let conn = self.conn.as_mut().ok_or(Error::NotRunning)?;
+        let mut req = [0u8; 23];
+        req[0] = 0x12;
+        req[1..3].copy_from_slice(&handle.to_le_bytes());
+        let n = data.len().min(20);
+        req[3..3 + n].copy_from_slice(&data[..n]);
+        conn.gatt_send_request(&req[..3 + n]);
+        Ok(())
+    }
+
+    /// GATT client: enable notifications on a CCCD (value 0x0001).
+    pub fn gatt_subscribe(&mut self, cccd_handle: u16) -> Result<(), Error> {
+        let conn = self.conn.as_mut().ok_or(Error::NotRunning)?;
+        let mut req = [0u8; 5];
+        req[0] = 0x12;
+        req[1..3].copy_from_slice(&cccd_handle.to_le_bytes());
+        req[3..5].copy_from_slice(&0x0001u16.to_le_bytes());
+        conn.gatt_send_request(&req);
+        Ok(())
+    }
+
+    /// GATT client: poll for a completed request response.
+    ///
+    /// Returns `(opcode, payload, length)` when a response arrived.
+    pub fn gatt_poll(&mut self) -> Option<(u8, [u8; 64], usize)> {
+        let conn = self.conn.as_mut()?;
+        let (op, buf, len) = conn.gatt_take_result();
+        if len > 0 {
+            Some((op, buf, len))
+        } else {
+            None
         }
     }
 

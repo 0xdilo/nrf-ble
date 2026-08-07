@@ -26,7 +26,7 @@
 //! use nrf_ble::ll::addr::AddrType;
 //!
 //! let p = nrf52832_pac::Peripherals::take().unwrap();
-//! let mut ble = Ble::new(p.RADIO, p.TIMER0);
+//! let mut ble = Ble::new(p.RADIO, p.TIMER0, p.CCM);
 //!
 //! ble.gap_address_set([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], AddrType::Public);
 //! let adv_data = [

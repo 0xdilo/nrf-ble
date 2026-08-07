@@ -46,6 +46,16 @@ pub enum TxPower {
 }
 
 /// nRF52 RADIO driver in BLE 1 Mbit/s mode.
+/// Radio PHY options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phy {
+    /// BLE 1 Mbit/s (LE 1M).
+    Ble1Mbit,
+    /// BLE 2 Mbit/s (LE 2M).
+    Ble2Mbit,
+}
+
+/// nRF52 RADIO driver.
 pub struct Radio {
     regs: pac::RADIO,
 }
@@ -54,6 +64,23 @@ impl Radio {
     /// Wrap the RADIO peripheral.
     pub fn new(regs: pac::RADIO) -> Self {
         Radio { regs }
+    }
+
+    /// Select the PHY (1 Mbit/s or 2 Mbit/s).
+    pub fn set_phy(&self, phy: Phy) {
+        let r = &self.regs;
+        match phy {
+            Phy::Ble1Mbit => {
+                r.mode.write(|w| w.mode().ble_1mbit());
+                r.pcnf0
+                    .modify(|_, w| unsafe { w.s1len().bits(0) }.plen()._8bit());
+            }
+            Phy::Ble2Mbit => {
+                r.mode.write(|w| w.mode().ble_2mbit());
+                r.pcnf0
+                    .modify(|_, w| unsafe { w.s1len().bits(8) }.plen()._16bit());
+            }
+        }
     }
 
     /// Configure the radio for BLE 1 Mbit/s operation with the advertising
