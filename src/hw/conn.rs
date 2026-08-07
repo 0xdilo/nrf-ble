@@ -38,6 +38,19 @@ pub const LL_CONTROL_LENGTH_RSP: u8 = 0x14;
 
 /// L2CAP channel ID for the ATT protocol.
 pub const L2CAP_ATT_CID: u16 = 0x0004;
+pub const L2CAP_SIGNALING_CID: u16 = 0x0005;
+pub const L2CAP_SMP_CID_LOCAL: u16 = 0x0006;
+
+pub const LE_CREDIT_BASED_CONNECTION_REQ: u8 = 0x14;
+pub const LE_CREDIT_BASED_CONNECTION_RSP: u8 = 0x15;
+pub const LE_FLOW_CONTROL_CREDIT: u8 = 0x16;
+pub const LE_CREDIT_BASED_CONNECTION_END: u8 = 0x17;
+
+/// Local source CID used for our connection-oriented channels.
+pub const COC_LOCAL_CID: u16 = 0x0040;
+pub const COC_CREDITS: u16 = 8;
+pub const COC_MTU: u16 = 247;
+pub const COC_MPS: u16 = 251;
 
 /// ATT MTU of the server.
 pub const ATT_MTU_DEFAULT: usize = 23;
@@ -74,6 +87,55 @@ pub const HANDLE_TX_VALUE: u16 = 0x0005;
 pub const HANDLE_TX_CCCD: u16 = 0x0006;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A credit-based connection-oriented L2CAP channel.
+pub struct Coc {
+    /// Peer PSM.
+    pub psm: u16,
+    /// Local channel ID.
+    pub local_cid: u16,
+    /// Peer channel ID.
+    pub peer_cid: u16,
+    /// Credits we can use to send.
+    pub credits: u16,
+    /// Credits the peer has granted.
+    pub peer_credits: u16,
+    /// Channel MTU (SDU size).
+    pub mtu: u16,
+    /// Maximum PDU payload size.
+    pub mps: u16,
+    /// RX SDU buffer.
+    pub rx_sdu: [u8; 256],
+    /// RX SDU length so far.
+    pub rx_sdu_len: usize,
+    /// Expected SDU length.
+    pub rx_sdu_total: usize,
+    /// Peer SDU (the whole message) being sent.
+    pub tx_sdu: [u8; 256],
+    pub tx_sdu_len: usize,
+    pub tx_sdu_offset: usize,
+}
+
+impl Coc {
+    pub fn new(psm: u16) -> Coc {
+        Coc {
+            psm,
+            local_cid: COC_LOCAL_CID,
+            peer_cid: 0,
+            credits: 0,
+            peer_credits: 0,
+            mtu: COC_MTU,
+            mps: COC_MPS,
+            rx_sdu: [0; 256],
+            rx_sdu_len: 0,
+            rx_sdu_total: 0,
+            tx_sdu: [0; 256],
+            tx_sdu_len: 0,
+            tx_sdu_offset: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Role in the connection.
 pub enum ConnRole {
     /// We initiated the connection.
@@ -98,13 +160,16 @@ pub struct Conn {
     rx_l2cap: [u8; 256],
     rx_l2cap_len: usize,
     rx_l2cap_msg_len: usize,
+    rx_l2cap_cid: u16,
     tx_att: [u8; L2CAP_PAYLOAD_MAX],
     tx_att_len: usize,
     tx_frag_offset: usize,
     tx_pending: bool,
+    tx_cid: u16,
     att_mtu: u16,
     tx_pdu_max: usize,
     rx_pdu_max: usize,
+    pub coc: Option<Coc>,
     peer_version_ok: bool,
     pub last_rx: u32,
     terminate_pending: bool,
@@ -169,13 +234,16 @@ impl Conn {
             rx_l2cap: [0; 256],
             rx_l2cap_len: 0,
             rx_l2cap_msg_len: 0,
+            rx_l2cap_cid: L2CAP_ATT_CID,
             tx_att: [0; L2CAP_PAYLOAD_MAX],
             tx_att_len: 0,
             tx_frag_offset: 0,
             tx_pending: false,
+            tx_cid: L2CAP_ATT_CID,
             att_mtu: ATT_MTU_DEFAULT as u16,
             tx_pdu_max: LL_PDU_PAYLOAD_DEFAULT,
             rx_pdu_max: LL_PDU_PAYLOAD_DEFAULT,
+            coc: None,
             peer_version_ok: false,
             last_rx: now,
             terminate_pending: false,
@@ -416,7 +484,7 @@ impl Conn {
         self.tx_buf[1] = payload_len as u8;
         if first {
             self.tx_buf[2..4].copy_from_slice(&(att_len as u16).to_le_bytes());
-            self.tx_buf[4..6].copy_from_slice(&L2CAP_ATT_CID.to_le_bytes());
+            self.tx_buf[4..6].copy_from_slice(&self.tx_cid.to_le_bytes());
             self.tx_buf[6..6 + chunk]
                 .copy_from_slice(&self.tx_att[self.tx_frag_offset..self.tx_frag_offset + chunk]);
         } else {
@@ -491,6 +559,175 @@ impl Conn {
         }
     }
 
+    fn handle_le_signaling(&mut self, body: &[u8]) {
+        if body.len() < 4 {
+            return;
+        }
+        let code = body[0];
+        match code {
+            LE_CREDIT_BASED_CONNECTION_REQ => {
+                if body.len() < 12 {
+                    return;
+                }
+                let psm = u16::from_le_bytes([body[2], body[3]]);
+                let peer_cid = u16::from_le_bytes([body[4], body[5]]);
+                let mtu = u16::from_le_bytes([body[6], body[7]]);
+                let mps = u16::from_le_bytes([body[8], body[9]]);
+                let credits = u16::from_le_bytes([body[10], body[11]]);
+                let mut coc = Coc::new(psm);
+                coc.peer_cid = peer_cid;
+                coc.mtu = mtu.min(COC_MTU);
+                coc.mps = mps.min(COC_MPS);
+                coc.credits = credits;
+                self.coc = Some(coc);
+                let mut rsp = [0u8; 16];
+                rsp[0] = LE_CREDIT_BASED_CONNECTION_RSP;
+                rsp[1] = 0;
+                rsp[2..4].copy_from_slice(&peer_cid.to_le_bytes());
+                rsp[4..6].copy_from_slice(&COC_MTU.to_le_bytes());
+                rsp[6..8].copy_from_slice(&COC_MPS.to_le_bytes());
+                rsp[8..10].copy_from_slice(&COC_CREDITS.to_le_bytes());
+                rsp[10..12].copy_from_slice(&0u16.to_le_bytes());
+                self.queue_signaling(&rsp[..12]);
+            }
+            LE_CREDIT_BASED_CONNECTION_RSP => {
+                if let Some(coc) = &mut self.coc {
+                    let peer_cid = u16::from_le_bytes([body[2], body[3]]);
+                    let mtu = u16::from_le_bytes([body[4], body[5]]);
+                    let mps = u16::from_le_bytes([body[6], body[7]]);
+                    let credits = u16::from_le_bytes([body[8], body[9]]);
+                    let result = u16::from_le_bytes([body[10], body[11]]);
+                    if result == 0 {
+                        coc.peer_cid = peer_cid;
+                        coc.mtu = coc.mtu.min(mtu);
+                        coc.mps = coc.mps.min(mps);
+                        coc.peer_credits = credits;
+                    } else {
+                        self.coc = None;
+                    }
+                }
+            }
+            LE_FLOW_CONTROL_CREDIT => {
+                if let Some(coc) = &mut self.coc {
+                    if body.len() >= 6 {
+                        let cid = u16::from_le_bytes([body[2], body[3]]);
+                        let credits = u16::from_le_bytes([body[4], body[5]]);
+                        if cid == coc.local_cid || cid == coc.peer_cid {
+                            coc.credits = coc.credits.saturating_add(credits);
+                        }
+                    }
+                }
+            }
+            LE_CREDIT_BASED_CONNECTION_END => {
+                if let Some(coc) = &mut self.coc {
+                    let cid = u16::from_le_bytes([body[2], body[3]]);
+                    if cid == coc.local_cid || cid == coc.peer_cid {
+                        self.coc = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn queue_signaling(&mut self, msg: &[u8]) {
+        let n = msg.len().min(self.tx_att.len() - 4);
+        self.tx_att[..n].copy_from_slice(&msg[..n]);
+        self.tx_att_len = n;
+        self.tx_cid = L2CAP_SIGNALING_CID;
+        self.tx_frag_offset = 0;
+        self.tx_pending = true;
+    }
+
+    /// Queue a CoC open request for a PSM (initiator side).
+    pub fn l2cap_connect(&mut self, psm: u16) {
+        if self.coc.is_some() {
+            return;
+        }
+        self.coc = Some(Coc::new(psm));
+        let mut req = [0u8; 12];
+        req[0] = LE_CREDIT_BASED_CONNECTION_REQ;
+        req[1] = 0;
+        req[2..4].copy_from_slice(&psm.to_le_bytes());
+        req[4..6].copy_from_slice(&COC_LOCAL_CID.to_le_bytes());
+        req[6..8].copy_from_slice(&COC_MTU.to_le_bytes());
+        req[8..10].copy_from_slice(&COC_MPS.to_le_bytes());
+        req[10..12].copy_from_slice(&COC_CREDITS.to_le_bytes());
+        self.queue_signaling(&req);
+    }
+
+    /// Queue application data for the CoC channel. The SDU is framed with
+    /// its length and sent (consuming one credit) via the normal
+    /// fragmenter.
+    pub fn l2cap_send(&mut self, data: &[u8]) -> Result<(), Error> {
+        let coc = self.coc.as_mut().ok_or(Error::NotRunning)?;
+        if data.len() > coc.mtu as usize || data.len() + 2 > self.tx_att.len() {
+            return Err(Error::InvalidLength);
+        }
+        if coc.credits == 0 {
+            return Err(Error::NotRunning);
+        }
+        coc.credits -= 1;
+        let total = data.len() + 2;
+        self.tx_att[..2].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        self.tx_att[2..total].copy_from_slice(data);
+        self.tx_att_len = total;
+        self.tx_cid = coc.local_cid;
+        self.tx_frag_offset = 0;
+        self.tx_pending = true;
+        Ok(())
+    }
+
+    /// Assemble an incoming CoC SDU from a data frame; reports
+    /// [`ConnEvent::Data`] when a complete SDU arrived (and returns the
+    /// credit for it).
+    fn rx_coc_sdu(&mut self, body: &[u8], result: &mut ConnEvent) {
+        let mut complete = false;
+        let mut total = 0usize;
+        let mut sdu = [0u8; 256];
+        let peer_cid;
+        {
+            let Some(coc) = &mut self.coc else {
+                return;
+            };
+            if coc.rx_sdu_len == 0 {
+                if body.len() < 2 {
+                    return;
+                }
+                coc.rx_sdu_total = u16::from_le_bytes([body[0], body[1]]) as usize;
+                coc.rx_sdu_len = 0;
+                let chunk = &body[2..];
+                let n = chunk.len().min(coc.rx_sdu.len() - coc.rx_sdu_len);
+                coc.rx_sdu[coc.rx_sdu_len..coc.rx_sdu_len + n].copy_from_slice(&chunk[..n]);
+                coc.rx_sdu_len += n;
+            } else {
+                let n = body.len().min(coc.rx_sdu.len() - coc.rx_sdu_len);
+                coc.rx_sdu[coc.rx_sdu_len..coc.rx_sdu_len + n].copy_from_slice(&body[..n]);
+                coc.rx_sdu_len += n;
+            }
+            peer_cid = coc.peer_cid;
+            if coc.rx_sdu_len >= coc.rx_sdu_total {
+                total = coc.rx_sdu_total.min(sdu.len());
+                sdu[..total].copy_from_slice(&coc.rx_sdu[..total]);
+                coc.rx_sdu_len = 0;
+                coc.rx_sdu_total = 0;
+                complete = true;
+            }
+        }
+        if complete {
+            let mut credit = [0u8; 6];
+            credit[0] = LE_FLOW_CONTROL_CREDIT;
+            credit[1] = 0;
+            credit[2..4].copy_from_slice(&peer_cid.to_le_bytes());
+            credit[4..6].copy_from_slice(&1u16.to_le_bytes());
+            self.queue_signaling(&credit);
+            let n = total.min(self.rx_data.len());
+            self.rx_data[..n].copy_from_slice(&sdu[..n]);
+            self.rx_data_len = n;
+            *result = ConnEvent::Data;
+        }
+    }
+
     fn handle_smp(&mut self, body: &[u8], _result: &mut ConnEvent) {
         if body.is_empty() {
             return;
@@ -516,7 +753,7 @@ impl Conn {
                 l2[0..2].copy_from_slice(&7u16.to_le_bytes());
                 l2[2..4].copy_from_slice(&L2CAP_SMP_CID.to_le_bytes());
                 l2[4..11].copy_from_slice(&req);
-                self.queue_l2cap(&l2);
+                self.queue_l2cap(&l2, L2CAP_SMP_CID);
                 return;
             }
             SMP_PAIRING_REQUEST => {
@@ -557,7 +794,7 @@ impl Conn {
                     l2[0..2].copy_from_slice(&2u16.to_le_bytes());
                     l2[2..4].copy_from_slice(&L2CAP_SMP_CID.to_le_bytes());
                     l2[4..6].copy_from_slice(&failed);
-                    self.queue_l2cap(&l2);
+                    self.queue_l2cap(&l2, L2CAP_SMP_CID);
                     self.pairing_in_progress = false;
                     return;
                 }
@@ -569,7 +806,7 @@ impl Conn {
             l2[0..2].copy_from_slice(&(out_len as u16).to_le_bytes());
             l2[2..4].copy_from_slice(&L2CAP_SMP_CID.to_le_bytes());
             l2[4..4 + out_len].copy_from_slice(&out[..out_len]);
-            self.queue_l2cap(&l2[..4 + out_len]);
+            self.queue_l2cap(&l2[..4 + out_len], L2CAP_SMP_CID);
         }
         if complete {
             self.pairing_in_progress = false;
@@ -579,10 +816,12 @@ impl Conn {
         }
     }
 
-    pub fn queue_l2cap(&mut self, l2: &[u8]) {
+    pub fn queue_l2cap(&mut self, l2: &[u8], cid: u16) {
         let n = l2.len().min(self.tx_att.len());
         self.tx_att[..n].copy_from_slice(&l2[..n]);
         self.tx_att_len = n;
+        self.tx_cid = cid;
+        self.tx_frag_offset = 0;
         self.tx_pending = true;
     }
 
@@ -604,14 +843,31 @@ impl Conn {
             }
             self.rx_l2cap_len = 0;
             self.rx_l2cap_msg_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-            let cid = u16::from_le_bytes([payload[2], payload[3]]);
-            if cid == L2CAP_SMP_CID {
+            self.rx_l2cap_cid = u16::from_le_bytes([payload[2], payload[3]]);
+            let cid = self.rx_l2cap_cid;
+            if cid == L2CAP_SMP_CID_LOCAL {
                 let body = &payload[4..];
                 self.handle_smp(body, result);
                 self.rx_l2cap_len = 0;
                 return;
             }
+            if cid == L2CAP_SIGNALING_CID {
+                let body = &payload[4..];
+                self.handle_le_signaling(body);
+                self.rx_l2cap_len = 0;
+                return;
+            }
             if cid != L2CAP_ATT_CID {
+                let is_coc = self
+                    .coc
+                    .as_ref()
+                    .is_some_and(|c| c.peer_cid == cid || c.local_cid == cid);
+                if is_coc {
+                    let body = &payload[4..];
+                    self.rx_l2cap_len = 0;
+                    self.rx_coc_sdu(body, result);
+                    return;
+                }
                 *result = ConnEvent::L2cap(cid);
                 self.rx_l2cap_len = 0;
                 return;
@@ -1471,5 +1727,113 @@ impl Radio {
 impl BtTimer {
     fn dummy() -> BtTimer {
         BtTimer::new(unsafe { pac::Peripherals::steal() }.TIMER0)
+    }
+}
+
+#[cfg(test)]
+mod coc_tests {
+    use super::*;
+
+    fn conn() -> Conn {
+        let params = ConnectReqData {
+            access_addr: 0x1234_ABCD,
+            crc_init: 0x654321,
+            win_size: 1,
+            win_offset: 0,
+            interval: 24,
+            latency: 0,
+            timeout: 2000,
+            channel_map: [0xFF, 0xFF, 0xFF, 0xFF, 0x1F],
+            hop: 13,
+            sca: 2,
+        };
+        Conn::new(&params, 37, 0, ConnRole::Slave, ccm_regs())
+    }
+
+    fn ccm_regs() -> &'static pac::ccm::RegisterBlock {
+        unsafe { &*pac::CCM::ptr() }
+    }
+
+    #[test]
+    fn open_request_builds_correct_message() {
+        let mut c = conn();
+        c.l2cap_connect(0x1234);
+        // the signaling message is queued into tx_att
+        let msg = &c.tx_att[..c.tx_att_len];
+        assert_eq!(msg[0], LE_CREDIT_BASED_CONNECTION_REQ);
+        assert_eq!(u16::from_le_bytes([msg[2], msg[3]]), 0x1234);
+        assert_eq!(u16::from_le_bytes([msg[4], msg[5]]), COC_LOCAL_CID);
+        assert_eq!(c.tx_cid, L2CAP_SIGNALING_CID);
+    }
+
+    #[test]
+    fn peer_open_request_responds_and_opens() {
+        let mut c = conn();
+        let req = [
+            0x14u8, 0x00, // code, id
+            0x34, 0x12, // psm
+            0x41, 0x00, // peer cid 0x0041
+            0xF7, 0x00, // mtu 247
+            0xFB, 0x00, // mps 251
+            0x08, 0x00, // credits
+        ];
+        c.handle_le_signaling(&req);
+        let coc = c.coc.unwrap();
+        assert_eq!(coc.psm, 0x1234);
+        assert_eq!(coc.peer_cid, 0x0041);
+        assert_eq!(coc.credits, 8);
+        let rsp = &c.tx_att[..c.tx_att_len];
+        assert_eq!(rsp[0], LE_CREDIT_BASED_CONNECTION_RSP);
+        assert_eq!(u16::from_le_bytes([rsp[4], rsp[5]]), COC_MTU);
+    }
+
+    #[test]
+    fn credit_flow_limits_sending() {
+        let mut c = conn();
+        let req = [
+            0x14u8, 0x00, 0x34, 0x12, 0x41, 0x00, 0xF7, 0x00, 0xFB, 0x00, 0x01, 0x00,
+        ];
+        c.handle_le_signaling(&req);
+        assert!(c.l2cap_send(b"hello").is_ok());
+        assert!(c.l2cap_send(b"world").is_err());
+        // peer returns a credit
+        let credit = [0x16u8, 0x00, 0x40, 0x00, 0x01, 0x00];
+        c.handle_le_signaling(&credit);
+        assert!(c.l2cap_send(b"again").is_ok());
+    }
+
+    #[test]
+    fn sdu_framing_and_reassembly() {
+        let mut c = conn();
+        let req = [
+            0x14u8, 0x00, 0x34, 0x12, 0x41, 0x00, 0xF7, 0x00, 0xFB, 0x00, 0x08, 0x00,
+        ];
+        c.handle_le_signaling(&req);
+        let mut result = ConnEvent::Idle;
+        // one frame carrying the whole SDU
+        let mut frame = [0u8; 10];
+        frame[0..2].copy_from_slice(&5u16.to_le_bytes());
+        frame[2..7].copy_from_slice(b"hello");
+        c.rx_coc_sdu(&frame, &mut result);
+        assert_eq!(result, ConnEvent::Data);
+        assert_eq!(&c.rx_data[..5], b"hello");
+    }
+
+    #[test]
+    fn multi_frame_sdu_assembled() {
+        let mut c = conn();
+        let req = [
+            0x14u8, 0x00, 0x34, 0x12, 0x41, 0x00, 0xF7, 0x00, 0xFB, 0x00, 0x08, 0x00,
+        ];
+        c.handle_le_signaling(&req);
+        let mut result = ConnEvent::Idle;
+        let mut frame = [0u8; 7];
+        frame[0..2].copy_from_slice(&6u16.to_le_bytes());
+        frame[2..7].copy_from_slice(b"hello");
+        c.rx_coc_sdu(&frame, &mut result);
+        assert_eq!(result, ConnEvent::Idle);
+        c.rx_coc_sdu(b"!", &mut result);
+        assert_eq!(result, ConnEvent::Data);
+        assert_eq!(&c.rx_data[..6], b"hello!");
     }
 }

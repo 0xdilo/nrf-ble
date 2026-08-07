@@ -859,6 +859,19 @@ impl Ble {
         }
     }
 
+    /// L2CAP: open a credit-based connection-oriented channel (initiator).
+    pub fn l2cap_connect(&mut self, psm: u16) -> Result<(), Error> {
+        let conn = self.conn.as_mut().ok_or(Error::NotRunning)?;
+        conn.l2cap_connect(psm);
+        Ok(())
+    }
+
+    /// L2CAP: send data on the open connection-oriented channel.
+    pub fn l2cap_send(&mut self, data: &[u8]) -> Result<(), Error> {
+        let conn = self.conn.as_mut().ok_or(Error::NotRunning)?;
+        conn.l2cap_send(data)
+    }
+
     /// Start legacy Just Works pairing (master role: send the SMP pairing
     /// request; slave role: respond to the peer's request automatically).
     pub fn gap_pair(&mut self) -> Result<(), Error> {
@@ -870,7 +883,7 @@ impl Ble {
             l2[0..2].copy_from_slice(&7u16.to_le_bytes());
             l2[2..4].copy_from_slice(&super::smp::L2CAP_SMP_CID.to_le_bytes());
             l2[4..11].copy_from_slice(&req);
-            conn.queue_l2cap(&l2);
+            conn.queue_l2cap(&l2, super::smp::L2CAP_SMP_CID);
         } else {
             conn.smp.state = super::smp::SmpState::Idle;
         }
