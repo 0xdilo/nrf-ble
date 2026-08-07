@@ -2,7 +2,7 @@
 use crate::gap::ad::LEGACY_AD_DATA_MAX_LEN;
 use crate::ll::addr::{AddrType, BtAddr};
 use crate::ll::channels::ADV_CHANNELS;
-use crate::ll::pdu::{self, AdvPdu, ConnectReqData};
+use crate::ll::pdu::{self, AdvPdu, ConnectReqData, PDU_ADV_EXT_IND};
 use crate::Error;
 
 use super::conn::{BondInfo, BondStore, Conn, ConnEvent, ConnRole, DisconnectReason};
@@ -52,6 +52,9 @@ pub struct AdvParams {
     pub peer_addr: Option<[u8; 6]>,
     /// Channel map: bit 0 = channel 37, bit 1 = 38, bit 2 = 39.
     pub channel_map: u8,
+    /// Extended advertising: ADV_EXT_IND on the primary channels plus an
+    /// auxiliary packet on a data channel carrying the full payload.
+    pub extended: bool,
 }
 
 impl Default for AdvParams {
@@ -63,6 +66,7 @@ impl Default for AdvParams {
             own_addr_type: AddrType::Public,
             peer_addr: None,
             channel_map: 0b111,
+            extended: false,
         }
     }
 }
@@ -328,8 +332,16 @@ impl Ble {
         }
         self.adv_channel_idx = (ch_idx + 1) % 3;
         self.radio.set_channel(channel).ok();
-        self.build_adv_pdu();
+        if self.adv_params.extended {
+            self.build_ext_adv_pdu(channel);
+        } else {
+            self.build_adv_pdu();
+        }
         self.radio.transmit(&self.tx_buf[..self.tx_pdu_len]);
+        if self.adv_params.extended {
+            self.transmit_aux_adv();
+            return;
+        }
         match self.adv_params.adv_type {
             AdvType::ConnectableUndirected | AdvType::ConnectableDirected => {
                 self.listen_for_scan_and_connect(channel);
@@ -576,6 +588,51 @@ impl Ble {
         self.tx_pdu_len = len;
     }
 
+    fn build_ext_adv_pdu(&mut self, primary_channel: u8) {
+        let aux = crate::ll::pdu::AuxPtr {
+            channel: 0,
+            offset: 5,
+            phy: 0,
+        };
+        let mode = match self.adv_params.adv_type {
+            AdvType::ConnectableUndirected => 0b001,
+            AdvType::ScannableUndirected => 0b010,
+            _ => 0,
+        };
+        let tx_add = self.own_addr_type.is_random();
+        let len = AdvPdu::AdvExtInd {
+            adv_addr: &self.own_addr,
+            adv_mode: mode,
+            adi: [0, 0],
+            aux_ptr: aux,
+        }
+        .encode_typed(&mut self.tx_buf, tx_add, false)
+        .unwrap();
+        self.tx_pdu_len = len;
+        let _ = primary_channel;
+    }
+
+    fn transmit_aux_adv(&mut self) {
+        let tx_add = self.own_addr_type.is_random();
+        let len = AdvPdu::AuxAdvExtInd {
+            adv_addr: &self.own_addr,
+            adi: [0, 0],
+            ext_type: 0x00,
+            data: &self.adv_data[..self.adv_data_len],
+        }
+        .encode_typed(&mut self.tx_buf, tx_add, false)
+        .unwrap();
+        let deadline = self.timer.now().wrapping_add(timeout_ticks(200));
+        self.timer.set_compare(deadline);
+        while self.timer.now() < deadline {}
+        self.timer.clear_compare();
+        self.radio.set_channel(0).ok();
+        self.radio.transmit(&self.tx_buf[..len]);
+        self.radio
+            .set_channel(crate::ll::channels::ADV_CHANNELS[0])
+            .ok();
+    }
+
     fn listen_for_scan_req(&mut self) {
         if self.radio_window(1 << pdu::PDU_SCAN_REQ, SCAN_REQ_WINDOW_MICROS)
             && self.scan_rsp_len > 0
@@ -679,6 +736,19 @@ impl Ble {
                     report = Some((addr, pdu.pdu_type(), buf, data_len));
                     respond = self.scan_params.active;
                 }
+                AdvPdu::AdvExtInd {
+                    adv_addr, aux_ptr, ..
+                } => {
+                    let addr = *adv_addr;
+                    let ptr = aux_ptr;
+                    if let Some((aux_addr, aux_data, aux_len)) = self.follow_aux(&ptr) {
+                        let mut buf = [0u8; 31];
+                        let data_len = aux_len.min(31);
+                        buf[..data_len].copy_from_slice(&aux_data[..data_len]);
+                        report = Some((addr, PDU_ADV_EXT_IND, buf, data_len));
+                        let _ = aux_addr;
+                    }
+                }
                 _ => {}
             }
         }
@@ -743,6 +813,43 @@ impl Ble {
         self.scan_state = ScanState::Idle;
         self.push_event(BleEvent::Connected { conn: ll });
         let _ = scannable;
+    }
+
+    fn follow_aux(&mut self, ptr: &crate::ll::pdu::AuxPtr) -> Option<([u8; 6], [u8; 40], usize)> {
+        self.radio.set_channel(ptr.channel).ok()?;
+        let deadline = self.timer.now().wrapping_add(timeout_ticks(300));
+        self.timer.set_compare(deadline);
+        while self.timer.now() < deadline {}
+        self.timer.clear_compare();
+        self.radio.receive_start(&mut self.rx_buf);
+        let mut spins = 0u32;
+        loop {
+            match self.radio.receive_poll(&self.rx_buf) {
+                Ok(Some(len)) => {
+                    if let Ok(AdvPdu::AuxAdvExtInd { adv_addr, data, .. }) =
+                        AdvPdu::decode(&self.rx_buf[..len])
+                    {
+                        let mut out = [0u8; 40];
+                        let n = data.len().min(40);
+                        out[..n].copy_from_slice(&data[..n]);
+                        return Some((*adv_addr, out, n));
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    spins += 1;
+                    if spins > 200_000 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        self.radio.receive_cancel();
+        self.radio
+            .set_channel(crate::ll::channels::ADV_CHANNELS[0])
+            .ok();
+        None
     }
 
     fn respond_scan_req(&mut self) {

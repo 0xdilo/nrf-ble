@@ -1766,9 +1766,8 @@ mod data_path_tests {
         req[3..5].copy_from_slice(&2120u16.to_le_bytes());
         req[5..7].copy_from_slice(&251u16.to_le_bytes());
         req[7..9].copy_from_slice(&2120u16.to_le_bytes());
-        let mut r = Radio::dummy();
-        c.handle_ll_control(&req, &mut r, &BtTimer::dummy())
-            .unwrap();
+        let r = Radio::dummy();
+        c.handle_ll_control(&req, &r, &BtTimer::dummy()).unwrap();
         assert_eq!(c.tx_pdu_max, 251);
         assert!(c.pending_control.is_some());
     }

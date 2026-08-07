@@ -14,6 +14,8 @@ pub const PDU_SCAN_RSP: u8 = 0b0100;
 pub const PDU_CONNECT_REQ: u8 = 0b0101;
 /// Scannable undirected advertising indication.
 pub const PDU_ADV_SCAN_IND: u8 = 0b0110;
+/// Extended advertising indication (primary or auxiliary).
+pub const PDU_ADV_EXT_IND: u8 = 0b0111;
 
 /// LLID: LL Data PDU, start of a new L2CAP PDU.
 pub const LLID_DATA_START: u8 = 0b01;
@@ -118,6 +120,28 @@ pub enum AdvPdu<'a> {
         /// Advertising data.
         data: &'a [u8],
     },
+    /// ADV_EXT_IND (primary or auxiliary).
+    AdvExtInd {
+        /// Advertiser address.
+        adv_addr: &'a [u8; 6],
+        /// AdvMode byte (mode in bits 0-1, address type in bits 2-4).
+        adv_mode: u8,
+        /// Advertising data ID (DI + DID).
+        adi: [u8; 2],
+        /// Auxiliary packet pointer (primary packets only).
+        aux_ptr: AuxPtr,
+    },
+    /// ADV_EXT_IND with an extended header and advertising data (aux).
+    AuxAdvExtInd {
+        /// Advertiser address.
+        adv_addr: &'a [u8; 6],
+        /// Advertising data ID.
+        adi: [u8; 2],
+        /// Extended header type octet.
+        ext_type: u8,
+        /// Advertising data.
+        data: &'a [u8],
+    },
 }
 
 impl<'a> AdvPdu<'a> {
@@ -192,6 +216,40 @@ impl<'a> AdvPdu<'a> {
                     data,
                 })
             }
+            PDU_ADV_EXT_IND => {
+                if payload.len() == 12 {
+                    let addr = payload[..6].try_into().map_err(|_| Error::InvalidLength)?;
+                    let mode = payload[6];
+                    let adi = [payload[7], payload[8]];
+                    let aux = payload[9..12]
+                        .try_into()
+                        .map_err(|_| Error::InvalidLength)?;
+                    Ok(AdvPdu::AdvExtInd {
+                        adv_addr: addr,
+                        adv_mode: mode,
+                        adi,
+                        aux_ptr: AuxPtr::decode(aux),
+                    })
+                } else if payload.len() >= 10 {
+                    // aux packet: AdvA + Adi + extended header + AD data
+                    let addr = payload[..6].try_into().map_err(|_| Error::InvalidLength)?;
+                    let adi = [payload[6], payload[7]];
+                    let ehs_len = payload[8] as usize;
+                    let ehs_end = 9 + ehs_len;
+                    if payload.len() >= ehs_end {
+                        Ok(AdvPdu::AuxAdvExtInd {
+                            adv_addr: addr,
+                            adi,
+                            ext_type: payload[9],
+                            data: &payload[ehs_end..],
+                        })
+                    } else {
+                        Err(Error::InvalidLength)
+                    }
+                } else {
+                    Err(Error::InvalidLength)
+                }
+            }
             _ => Err(Error::InvalidPdu),
         }
     }
@@ -262,6 +320,29 @@ impl<'a> AdvPdu<'a> {
                 o[6..12].copy_from_slice(adv_addr);
                 o[12..34].copy_from_slice(ll_data);
             }),
+            AdvPdu::AdvExtInd {
+                adv_addr,
+                adv_mode,
+                adi,
+                aux_ptr,
+            } => Self::encode_with(out, PDU_ADV_EXT_IND, tx_add, false, 12, |o| {
+                o[..6].copy_from_slice(adv_addr);
+                o[6] = adv_mode;
+                o[7..9].copy_from_slice(&adi);
+                o[9..12].copy_from_slice(&aux_ptr.encode());
+            }),
+            AdvPdu::AuxAdvExtInd {
+                adv_addr,
+                adi,
+                ext_type,
+                data,
+            } => Self::encode_with(out, PDU_ADV_EXT_IND, tx_add, false, 10 + data.len(), |o| {
+                o[..6].copy_from_slice(adv_addr);
+                o[6..8].copy_from_slice(&adi);
+                o[8] = 1;
+                o[9] = ext_type;
+                o[10..].copy_from_slice(data);
+            }),
         }
     }
 
@@ -275,6 +356,8 @@ impl<'a> AdvPdu<'a> {
             AdvPdu::ScanRsp { .. } => PDU_SCAN_RSP,
             AdvPdu::ConnectReq { .. } => PDU_CONNECT_REQ,
             AdvPdu::AdvScanInd { .. } => PDU_ADV_SCAN_IND,
+            AdvPdu::AdvExtInd { .. } => PDU_ADV_EXT_IND,
+            AdvPdu::AuxAdvExtInd { .. } => PDU_ADV_EXT_IND,
         }
     }
 
@@ -371,6 +454,37 @@ impl<'a> DataPdu<'a> {
         out[1] = (self.payload.len() as u8) & 0b11_1111;
         out[2..total].copy_from_slice(self.payload);
         Ok(total)
+    }
+}
+
+/// Auxiliary packet pointer from an ADV_EXT_IND PDU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuxPtr {
+    /// Auxiliary channel index (a data channel, 0-36).
+    pub channel: u8,
+    /// Offset from the end of the primary PDU in 30 us units.
+    pub offset: u16,
+    /// Auxiliary PHY (0 = 1M, 1 = 2M, 2 = coded).
+    pub phy: u8,
+}
+
+impl AuxPtr {
+    /// Decode a 3-byte auxiliary pointer (channel, offset, PHY).
+    pub const fn decode(bytes: [u8; 3]) -> AuxPtr {
+        AuxPtr {
+            channel: bytes[0] & 0x3F,
+            offset: ((bytes[0] >> 6) as u16) | ((bytes[1] as u16) << 2),
+            phy: bytes[2] & 0x03,
+        }
+    }
+
+    /// Encode the pointer into 3 bytes.
+    pub const fn encode(&self) -> [u8; 3] {
+        [
+            (self.channel & 0x3F) | ((self.offset & 0x03) as u8) << 6,
+            ((self.offset >> 2) & 0xFF) as u8,
+            self.phy & 0x03,
+        ]
     }
 }
 
@@ -589,5 +703,70 @@ mod tests {
     #[test]
     fn reserved_pdu_type_rejected() {
         assert!(AdvPdu::decode(&[0x08, 0x00]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ext_adv_tests {
+    use super::*;
+
+    #[test]
+    fn aux_ptr_bit_layout() {
+        // channel 5, offset 0x1FF (511), phy 1
+        let p = AuxPtr {
+            channel: 5,
+            offset: 511,
+            phy: 1,
+        };
+        let e = p.encode();
+        assert_eq!(p, AuxPtr::decode(e));
+        // manual: channel 5 -> low 6 bits; offset 511 = 0b111111111 -> bits 6..18
+        assert_eq!(e[0] & 0x3F, 5);
+        assert_eq!(((e[0] >> 6) as u16) | ((e[1] as u16) << 2), 511);
+        assert_eq!(e[2] & 0x03, 1);
+    }
+
+    #[test]
+    fn adv_ext_ind_roundtrip() {
+        let pdu = AdvPdu::AdvExtInd {
+            adv_addr: &[0xAA; 6],
+            adv_mode: 0b001,
+            adi: [0x12, 0x34],
+            aux_ptr: AuxPtr {
+                channel: 3,
+                offset: 64,
+                phy: 0,
+            },
+        };
+        let mut buf = [0u8; 32];
+        let n = pdu.encode(&mut buf).unwrap();
+        assert_eq!(n, 14);
+        assert_eq!(buf[0] & 0x0F, PDU_ADV_EXT_IND);
+        let decoded = AdvPdu::decode(&buf[..n]).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[test]
+    fn aux_adv_ext_ind_roundtrip() {
+        let pdu = AdvPdu::AuxAdvExtInd {
+            adv_addr: &[0xBB; 6],
+            adi: [0x56, 0x78],
+            ext_type: 0x00,
+            data: &[0x02, 0x01, 0x06, 0x05, 0x09, b'h', b'e', b'l', b'l', b'o'],
+        };
+        let mut buf = [0u8; 40];
+        let n = pdu.encode(&mut buf).unwrap();
+        assert_eq!(n, 2 + 10 + 10);
+        assert_eq!(buf[10], 1);
+        assert_eq!(buf[11], 0x00);
+        match AdvPdu::decode(&buf[..n]).unwrap() {
+            AdvPdu::AuxAdvExtInd { data, .. } => {
+                assert_eq!(
+                    data,
+                    &[0x02, 0x01, 0x06, 0x05, 0x09, b'h', b'e', b'l', b'l', b'o']
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
