@@ -34,6 +34,7 @@ pub(crate) use nrf52833_pac as pac;
 pub(crate) use nrf52840_pac as pac;
 
 mod ble;
+mod bond_flash;
 mod ccm;
 mod conn;
 mod radio;
