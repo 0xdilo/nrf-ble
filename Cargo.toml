@@ -11,10 +11,12 @@ repository = "https://github.com/0xdilo/nrf-ble"
 
 [dependencies]
 aes = { version = "0.8", default-features = false, features = ["hazmat"] }
+cmac = "0.7"
 nrf52811-pac = { version = "0.12.2", optional = true }
 nrf52832-pac = { version = "0.12.2", optional = true }
 nrf52833-pac = { version = "0.12.2", optional = true }
 nrf52840-pac = { version = "0.12.2", optional = true }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh", "expose-field"] }
 
 [features]
 default = ["nrf52832", "sim"]

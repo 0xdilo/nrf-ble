@@ -2,6 +2,22 @@
 
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
+use cmac::{Cmac, Mac};
+use p256::ecdh::diffie_hellman;
+use p256::elliptic_curve::sec1::FromEncodedPoint;
+use p256::{EncodedPoint, PublicKey as P256Public, SecretKey};
+
+/// SMP opcode: public key exchange.
+pub const SMP_PUBLIC_KEY: u8 = 0x0C;
+
+fn aes_cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
+    let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(key).unwrap();
+    mac.update(data);
+    let out = mac.finalize();
+    let mut res = [0u8; 16];
+    res.copy_from_slice(&out.into_bytes());
+    res
+}
 
 /// Legacy Just Works TK: all-zero 16 bytes.
 pub const TK_JUST_WORKS: [u8; 16] = [0; 16];
@@ -167,6 +183,20 @@ pub struct Smp {
     pub responder: bool,
     /// Last pairing failure reason.
     pub pairing_failed: u8,
+    /// Optional 6-digit passkey (legacy passkey entry; `None` = Just Works).
+    pub passkey: Option<u32>,
+    /// True when LE Secure Connections was negotiated.
+    pub sc: bool,
+    /// Our P-256 private key (32 bytes).
+    pub own_private: [u8; 32],
+    /// Peer public key (64 bytes, uncompressed point without the prefix).
+    pub peer_public: [u8; 64],
+    /// Shared ECDH secret.
+    pub dhkey: [u8; 32],
+    /// Our SC nonce.
+    pub sc_nonce: [u8; 16],
+    /// Peer SC nonce.
+    pub peer_nonce: [u8; 16],
 }
 
 impl Default for Smp {
@@ -193,16 +223,49 @@ impl Smp {
             stk: [0; 16],
             responder: false,
             pairing_failed: 0,
+            passkey: None,
+            sc: false,
+            own_private: [0; 32],
+            peer_public: [0; 64],
+            dhkey: [0; 32],
+            sc_nonce: [0; 16],
+            peer_nonce: [0; 16],
         }
     }
 
-    /// Build a legacy pairing request (Just Works, bonding, 16-byte key).
+    /// Configure a 6-digit passkey (legacy passkey entry; display or
+    /// keyboard role). `None` selects Just Works.
+    pub fn set_passkey(&mut self, passkey: Option<u32>) {
+        self.passkey = passkey;
+    }
+
+    /// Enable LE Secure Connections (ECDH P-256 based pairing).
+    pub fn enable_sc(&mut self) {
+        self.sc = true;
+    }
+
+    fn tk(&self) -> [u8; 16] {
+        match self.passkey {
+            Some(pk) => {
+                let mut tk = [0u8; 16];
+                tk[..4].copy_from_slice(&pk.to_le_bytes());
+                tk
+            }
+            None => TK_JUST_WORKS,
+        }
+    }
+
+    /// Build a pairing request (bonding, 16-byte key).
     pub fn build_pairing_request(&mut self) -> [u8; 7] {
         let mut p = [0u8; 7];
         p[0] = SMP_PAIRING_REQUEST;
-        p[1] = IO_NO_INPUT_NO_OUTPUT;
+        p[1] = if self.passkey.is_some() {
+            0x02
+        } else {
+            IO_NO_INPUT_NO_OUTPUT
+        };
         p[2] = 0;
-        p[3] = 0x01;
+        p[3] = 0x01 | if self.sc { 0x08 } else { 0 };
         p[4] = 16;
         p[5] = 0x01;
         p[6] = 0x01;
@@ -241,6 +304,69 @@ impl Smp {
         Ok(())
     }
 
+    /// Generate the P-256 key pair and build the SMP_PUBLIC_KEY PDU
+    /// (65 bytes: opcode + 64-byte uncompressed point).
+    pub fn build_public_key(&mut self) -> [u8; 65] {
+        let sk = SecretKey::from_bytes(&self.own_private.into()).unwrap();
+        let pk = sk.public_key();
+        let point = EncodedPoint::from(pk);
+        let mut out = [0u8; 65];
+        out[0] = SMP_PUBLIC_KEY;
+        out[1..].copy_from_slice(&point.as_bytes()[1..]);
+        out
+    }
+
+    /// Handle the peer public key and compute the shared DHKey.
+    pub fn handle_public_key(&mut self, data: &[u8]) -> Result<(), SmpError> {
+        if data.len() < 65 {
+            return Err(SmpError::InvalidPdu);
+        }
+        self.peer_public[..].copy_from_slice(&data[1..65]);
+        let mut enc = [0u8; 65];
+        enc[0] = 0x04;
+        enc[1..].copy_from_slice(&data[1..65]);
+        let point = EncodedPoint::from_bytes(enc).map_err(|_| SmpError::InvalidPdu)?;
+        let peer = Option::<P256Public>::from(P256Public::from_encoded_point(&point))
+            .ok_or(SmpError::InvalidPdu)?;
+        let sk =
+            SecretKey::from_bytes(&self.own_private.into()).map_err(|_| SmpError::InvalidPdu)?;
+        let dh = diffie_hellman(sk.to_nonzero_scalar(), peer.as_affine());
+        let raw = dh.raw_secret_bytes();
+        self.dhkey[..].copy_from_slice(raw);
+        self.sc = true;
+        Ok(())
+    }
+
+    /// Compute the SC LTK with f5 (kernel-verified construction).
+    ///
+    /// `n1`/`a1` are the initiator nonce/address, `n2`/`a2` the responder's.
+    pub fn compute_ltk_sc(
+        &self,
+        n1: &[u8; 16],
+        n2: &[u8; 16],
+        a1: &[u8; 7],
+        a2: &[u8; 7],
+    ) -> [u8; 16] {
+        let btle = [0x65u8, 0x6c, 0x74, 0x62];
+        let salt = [
+            0xbe, 0x83, 0x60, 0x5a, 0xdb, 0x0b, 0x37, 0x60, 0x38, 0xa5, 0xf5, 0xaa, 0x91, 0x83,
+            0x88, 0x6c,
+        ];
+        let length = [0x00u8, 0x01];
+        let t = aes_cmac(&salt, &self.dhkey);
+        let mut m = [0u8; 53];
+        m[..2].copy_from_slice(&length);
+        m[2..9].copy_from_slice(a2);
+        m[9..16].copy_from_slice(a1);
+        m[16..32].copy_from_slice(n2);
+        m[32..48].copy_from_slice(n1);
+        m[48..52].copy_from_slice(&btle);
+        m[52] = 0;
+        let mackey = aes_cmac(&t, &m);
+        m[52] = 1;
+        aes_cmac(&mackey, &m)
+    }
+
     /// Build a SMP_PAIRING_FAILED PDU.
     pub fn build_failed(&self, reason: u8) -> [u8; 2] {
         [SMP_PAIRING_FAILED, reason]
@@ -272,8 +398,9 @@ impl Smp {
         for b in self.own_random.iter_mut() {
             *b = 0x5A;
         }
+        let tk = self.tk();
         self.own_confirm = c1(
-            &TK_JUST_WORKS,
+            &tk,
             &C1Inputs {
                 r: self.own_random,
                 preq: self.preq,
@@ -315,8 +442,9 @@ impl Smp {
             return Err(SmpError::InvalidPdu);
         }
         self.peer_random[..].copy_from_slice(&data[1..17]);
+        let tk = self.tk();
         let expected = c1(
-            &TK_JUST_WORKS,
+            &tk,
             &C1Inputs {
                 r: self.peer_random,
                 preq: self.preq,
@@ -331,7 +459,8 @@ impl Smp {
             self.pairing_failed = SMP_REASON_CONFIRM;
             return Err(SmpError::ConfirmMismatch);
         }
-        self.stk = s1(&TK_JUST_WORKS, &self.own_random, &self.peer_random);
+        let tk = self.tk();
+        self.stk = s1(&tk, &self.own_random, &self.peer_random);
         self.state = SmpState::WaitingStartEnc;
         self.pairing_failed = 0;
         let mut out = [0u8; 17];
@@ -413,5 +542,93 @@ mod tests {
         a.handle_random(&rnd_b).unwrap();
         assert_eq!(a.stk, b.stk);
         assert!(!a.stk.iter().all(|&x| x == 0));
+    }
+}
+
+#[cfg(test)]
+mod sc_tests {
+    use super::*;
+
+    #[test]
+    fn f5_matches_reference() {
+        let dhkey = hex32("5fd14503997d08fc21ec94741882e4ed665e1dba4ee4bdcc6cb61f1a177e9817");
+        let n1 = core::array::from_fn(|i| i as u8);
+        let n2 = core::array::from_fn(|i| (i + 16) as u8);
+        let a1 = {
+            let mut a = [0xAAu8; 7];
+            a[6] = 0;
+            a
+        };
+        let a2 = {
+            let mut a = [0xBBu8; 7];
+            a[6] = 1;
+            a
+        };
+        let mut smp = Smp::new();
+        smp.dhkey = dhkey;
+        smp.sc_nonce = n1;
+        smp.peer_nonce = n2;
+        let ltk = smp.compute_ltk_sc(&n1, &n2, &a1, &a2);
+        assert_eq!(ltk, hex16("36217fdd23fe9c5f8e401cfaaa464714"));
+    }
+
+    #[test]
+    fn ecdh_and_f5_end_to_end() {
+        // two peers with fixed private keys
+        let mut a = Smp::new();
+        let mut b = Smp::new();
+        a.own_private = hex32("1234567890123456789012345678901234567890123456789012345678901234");
+        b.own_private = hex32("abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let pka = a.build_public_key();
+        let pkb = b.build_public_key();
+        assert_eq!(pka[0], SMP_PUBLIC_KEY);
+        assert_eq!(pka[1], 0xCA);
+        a.handle_public_key(&pkb).unwrap();
+        b.handle_public_key(&pka).unwrap();
+        assert_eq!(a.dhkey, b.dhkey);
+        assert_eq!(
+            a.dhkey,
+            hex32("5fd14503997d08fc21ec94741882e4ed665e1dba4ee4bdcc6cb61f1a177e9817")
+        );
+        let a1 = {
+            let mut x = [0xAAu8; 7];
+            x[6] = 0;
+            x
+        };
+        let a2 = {
+            let mut x = [0xBBu8; 7];
+            x[6] = 1;
+            x
+        };
+        a.sc_nonce = [7u8; 16];
+        a.peer_nonce = [9u8; 16];
+        b.sc_nonce = [9u8; 16];
+        b.peer_nonce = [7u8; 16];
+        assert_eq!(a.compute_ltk_sc(&a1, &a2), b.compute_ltk_sc(&a1, &a2));
+    }
+
+    #[test]
+    fn passkey_tk_layout() {
+        let mut s = Smp::new();
+        s.set_passkey(Some(123456));
+        let tk = s.tk();
+        assert_eq!(&tk[..4], &[0x40, 0xE2, 0x01, 0x00]);
+        assert_eq!(&tk[4..], &[0; 12]);
+    }
+
+    fn hex32(h: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
+    fn hex16(h: &str) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        for i in 0..16 {
+            out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
     }
 }
