@@ -340,16 +340,16 @@ impl Ble {
         self.radio.transmit(&self.tx_buf[..self.tx_pdu_len]);
         if self.adv_params.extended {
             self.transmit_aux_adv();
-            return;
-        }
-        match self.adv_params.adv_type {
-            AdvType::ConnectableUndirected | AdvType::ConnectableDirected => {
-                self.listen_for_scan_and_connect(channel);
+        } else {
+            match self.adv_params.adv_type {
+                AdvType::ConnectableUndirected | AdvType::ConnectableDirected => {
+                    self.listen_for_scan_and_connect(channel);
+                }
+                AdvType::ScannableUndirected => {
+                    self.listen_for_scan_req();
+                }
+                AdvType::NonConnectableUndirected => {}
             }
-            AdvType::ScannableUndirected => {
-                self.listen_for_scan_req();
-            }
-            AdvType::NonConnectableUndirected => {}
         }
         let ticks = self.adv_accum.next(self.adv_params.interval_min);
         let now = self.timer.now();

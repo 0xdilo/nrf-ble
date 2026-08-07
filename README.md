@@ -35,8 +35,20 @@ PC Bluetooth adapter):
   encrypted data path via the nRF52 CCM peripheral (13-byte BLE nonce,
   4-byte MIC, per-event packet counter, direction byte).
 - **LL**: connection parameter update (instant-based), PHY negotiation
-  (2M), 2 Mbit/s radio mode, channel map handling, supervision timeout,
-  terminate.
+  (2M + coded long range), 2 Mbit/s and coded radio modes, channel map
+  handling, supervision timeout, terminate, DLE (251-byte PDUs), data
+  channel fragmentation/reassembly across events.
+- **L2CAP**: credit-based connection-oriented channels (open/close/credit
+  flow, SDU framing), ATT and SMP channels.
+- **Privacy**: IRK-based resolvable private address generation and
+  resolution; accept-list filtering for scanning.
+- **SMP**: legacy Just Works, legacy passkey entry, and LE Secure
+  Connections Just Works (ECDH P-256, f5/AES-CMAC, cross-validated against
+  a Python reference); LL encryption via the CCM peripheral.
+- **Bonding**: LTK/IRK bond store (trait + in-RAM default).
+- **Extended advertising**: ADV_EXT_IND with auxiliary packets on data
+  channels, and scanner aux-pointer chasing.
+- **Power**: optional `wfi` feature (WFI in the blocking loops).
 
 The PC's Bluetooth controller on this desk cannot transmit LE at all
 (verified with a continuous 3-channel listener: zero advertisements, zero
@@ -44,7 +56,7 @@ CONNECT_REQs on air), and the second nRF is a bare-LL device with no
 L2CAP, so pairing/GATT could not be exercised against a live peer; both
 are covered by 64 host-side tests.
 
-Host-side (tested with `cargo test`, 64 tests):
+Host-side (tested with `cargo test`, 89 tests):
 
 - **Link Layer**: BLE CRC-24 (validated against the published check value
   `0xC25A56`), data whitening, advertising and data channel PDU codecs,
@@ -99,7 +111,7 @@ handler, test app) in release, `opt-level="s"` + fat LTO:
 
 | Component | Flash | RAM |
 |-----------|-------|-----|
-| nrf-ble stack + hwtest (full: adv + conns + GATT + SMP + encryption) | ~28 KB | ~1.5 KB |
+| nrf-ble stack + hwtest (everything above) | ~30 KB | ~1.5 KB |
 | SoftDevice S112 (the blob this replaces) | ~112 KB | ~4 KB+ reserved |
 
 The stack core is roughly 1-5 KB of code depending on what gets inlined.
@@ -171,7 +183,7 @@ handler, test app) in release, `opt-level="s"` + fat LTO:
 
 | Component | Flash | RAM |
 |-----------|-------|-----|
-| nrf-ble stack + hwtest (full: adv + conns + GATT + SMP + encryption) | ~28 KB | ~1.5 KB |
+| nrf-ble stack + hwtest (everything above) | ~30 KB | ~1.5 KB |
 | SoftDevice S112 (the blob this replaces) | ~112 KB | ~4 KB+ reserved |
 
 ## Hardware bring-up checklist
