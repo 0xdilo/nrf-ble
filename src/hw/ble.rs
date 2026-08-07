@@ -192,6 +192,7 @@ pub struct Ble {
     connect_target_type: AddrType,
     last_radio_channel: Option<u8>,
     accept_list: crate::ll::accept_list::AcceptList,
+    irk: Option<[u8; 16]>,
     ccm: &'static pac::ccm::RegisterBlock,
     tx_buf: [u8; RX_PDU_MAX],
     tx_pdu_len: usize,
@@ -231,6 +232,7 @@ impl Ble {
             connect_target_type: AddrType::Public,
             last_radio_channel: None,
             accept_list: crate::ll::accept_list::AcceptList::new(),
+            irk: None,
             ccm: ccm_regs,
             tx_buf: [0; RX_PDU_MAX],
             tx_pdu_len: 0,
@@ -408,6 +410,26 @@ impl Ble {
     /// Add a device to the accept list (max 8 entries).
     pub fn gap_accept_list_add(&mut self, addr: [u8; 6], addr_type: AddrType) -> bool {
         self.accept_list.add(addr, addr_type)
+    }
+
+    /// Set the IRK used for resolvable private address rotation.
+    pub fn gap_privacy_set(&mut self, irk: [u8; 16]) {
+        self.irk = Some(irk);
+    }
+
+    /// Rotate the own address to a fresh resolvable private address
+    /// derived from the IRK (and the current timer value as the prand).
+    ///
+    /// Call periodically while advertising to keep the address rotating.
+    pub fn gap_rotate_rpa(&mut self) -> bool {
+        let Some(irk) = self.irk else {
+            return false;
+        };
+        let prand = self.timer.now() & 0x00FF_FFFF;
+        let rpa = crate::ll::priv_::generate_rpa(&irk, prand);
+        self.own_addr = rpa;
+        self.own_addr_type = AddrType::RandomPrivateResolvable;
+        true
     }
 
     /// Clear the accept list.

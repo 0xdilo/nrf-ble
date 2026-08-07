@@ -118,6 +118,7 @@ impl Default for RamBondStore {
 }
 
 impl RamBondStore {
+    /// Create an empty bond store.
     pub const fn new() -> Self {
         RamBondStore { bonds: [None; 8] }
     }
@@ -1142,6 +1143,25 @@ impl Conn {
         self.pending_request = true;
     }
 
+    /// Parse the last (handle, ...) entry of a discovery response, for
+    /// multi-range continuation. Returns `None` for malformed responses.
+    #[cfg(test)]
+    pub fn att_response_last_handle(buf: &[u8]) -> Option<u16> {
+        if buf.len() < 2 {
+            return None;
+        }
+        let width = buf[1] as usize;
+        if width < 2 {
+            return None;
+        }
+        let entries = (buf.len() - 2) / width;
+        if entries == 0 {
+            return None;
+        }
+        let pos = 2 + (entries - 1) * width;
+        Some(u16::from_le_bytes([buf[pos], buf[pos + 1]]))
+    }
+
     pub fn gatt_take_result(&mut self) -> (u8, [u8; 64], usize) {
         let op = self.gatt_result[0];
         let len = self.gatt_result_len;
@@ -1657,6 +1677,19 @@ mod gatt_client_tests {
         assert!(c.pending_request);
         feed_response(&mut c, &[0x0B, 0x01, 0x02, 0x03]);
         assert!(!c.pending_request);
+    }
+
+    #[test]
+    fn discovery_last_handle_parsing() {
+        let rsp = [
+            0x11u8, 18, 0x01, 0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        ];
+        assert_eq!(Conn::att_response_last_handle(&rsp), Some(0x0001));
+        let rsp2 = [
+            0x09u8, 7, 0x02, 0x00, 1, 2, 3, 4, 5, 0x05, 0x00, 6, 7, 8, 9, 10,
+        ];
+        assert_eq!(Conn::att_response_last_handle(&rsp2), Some(0x0005));
+        assert_eq!(Conn::att_response_last_handle(&[0x09]), None);
     }
 
     #[test]

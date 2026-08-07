@@ -42,5 +42,9 @@ pub mod smp;
 mod timers;
 
 pub use ble::{AdvParams, AdvType, Ble, BleEvent, FilterPolicy, ScanParams};
-pub use conn::{DisconnectReason, LL_CONTROL_FEATURE_REQ, LL_CONTROL_FEATURE_RSP};
+pub use bond_flash::{decode_record, encode_record, FlashBondStore, BOND_RECORD_LEN};
+pub use conn::{
+    BondInfo, BondStore, DisconnectReason, RamBondStore, LL_CONTROL_FEATURE_REQ,
+    LL_CONTROL_FEATURE_RSP,
+};
 pub use radio::{Radio, TxPower};

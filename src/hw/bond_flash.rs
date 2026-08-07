@@ -7,7 +7,9 @@ use super::pac;
 pub const BOND_PAGE_MAGIC: u32 = 0x4E42_3144;
 /// Flash page size used for the bond page.
 pub const BOND_PAGE_SIZE: u32 = 4096;
+/// Maximum number of stored bonds.
 pub const BOND_MAX: usize = 8;
+/// Size of one serialized bond record.
 pub const BOND_RECORD_LEN: usize = 44;
 
 /// Serialize one bond record (44 bytes).
@@ -58,7 +60,13 @@ pub struct FlashBondStore {
 }
 
 impl FlashBondStore {
+    /// Open the store on a reserved page; loads existing bonds.
     pub fn new(nvmc: &'static pac::nvmc::RegisterBlock, base: u32) -> Self {
+        Self::open(nvmc, base)
+    }
+
+    /// Open the store (alias of [`FlashBondStore::new`]).
+    pub fn open(nvmc: &'static pac::nvmc::RegisterBlock, base: u32) -> Self {
         let mut store = FlashBondStore {
             base,
             nvmc,
@@ -73,6 +81,7 @@ impl FlashBondStore {
     }
 
     fn load_page(&mut self) {
+        debug_assert_eq!(self.base % BOND_PAGE_SIZE, 0);
         let magic = unsafe { (self.base as *const u32).read_volatile() };
         if magic != BOND_PAGE_MAGIC {
             return;
