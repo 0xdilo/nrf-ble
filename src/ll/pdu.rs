@@ -142,6 +142,25 @@ pub enum AdvPdu<'a> {
         /// Advertising data.
         data: &'a [u8],
     },
+    /// Auxiliary ADV_EXT_IND with a custom extended header (e.g. periodic
+    /// advertising info) and advertising data.
+    AuxAdvExtIndWithEh {
+        /// Advertiser address.
+        adv_addr: &'a [u8; 6],
+        /// Advertising data ID.
+        adi: [u8; 2],
+        /// Raw extended header (length octet + type octet + fields).
+        ehs: &'a [u8],
+        /// Advertising data.
+        data: &'a [u8],
+    },
+    /// Periodic advertising packet (3-byte payload on data channels).
+    PeriodicAdv {
+        /// AdvMode byte.
+        adv_mode: u8,
+        /// Advertising data ID.
+        adi: [u8; 2],
+    },
 }
 
 impl<'a> AdvPdu<'a> {
@@ -246,6 +265,11 @@ impl<'a> AdvPdu<'a> {
                     } else {
                         Err(Error::InvalidLength)
                     }
+                } else if payload.len() == 3 {
+                    Ok(AdvPdu::PeriodicAdv {
+                        adv_mode: payload[0],
+                        adi: [payload[1], payload[2]],
+                    })
                 } else {
                     Err(Error::InvalidLength)
                 }
@@ -343,6 +367,32 @@ impl<'a> AdvPdu<'a> {
                 o[9] = ext_type;
                 o[10..].copy_from_slice(data);
             }),
+            AdvPdu::AuxAdvExtIndWithEh {
+                adv_addr,
+                adi,
+                ehs,
+                data,
+            } => Self::encode_with(
+                out,
+                PDU_ADV_EXT_IND,
+                tx_add,
+                false,
+                8 + ehs.len() + data.len(),
+                |o| {
+                    o[..6].copy_from_slice(adv_addr);
+                    o[6..8].copy_from_slice(&adi);
+                    o[8] = ehs[0];
+                    o[9..9 + ehs.len() - 1].copy_from_slice(&ehs[1..]);
+                    let data_start = 9 + ehs.len() - 1;
+                    o[data_start..data_start + data.len()].copy_from_slice(data);
+                },
+            ),
+            AdvPdu::PeriodicAdv { adv_mode, adi } => {
+                Self::encode_with(out, PDU_ADV_EXT_IND, tx_add, false, 3, |o| {
+                    o[0] = adv_mode;
+                    o[1..3].copy_from_slice(&adi);
+                })
+            }
         }
     }
 
@@ -358,6 +408,8 @@ impl<'a> AdvPdu<'a> {
             AdvPdu::AdvScanInd { .. } => PDU_ADV_SCAN_IND,
             AdvPdu::AdvExtInd { .. } => PDU_ADV_EXT_IND,
             AdvPdu::AuxAdvExtInd { .. } => PDU_ADV_EXT_IND,
+            AdvPdu::AuxAdvExtIndWithEh { .. } => PDU_ADV_EXT_IND,
+            AdvPdu::PeriodicAdv { .. } => PDU_ADV_EXT_IND,
         }
     }
 
@@ -454,6 +506,45 @@ impl<'a> DataPdu<'a> {
         out[1] = (self.payload.len() as u8) & 0b11_1111;
         out[2..total].copy_from_slice(self.payload);
         Ok(total)
+    }
+}
+
+/// Periodic advertising AD type in the extended header.
+pub const EXT_AD_PERIODIC: u8 = 0x20;
+
+/// Extended header fields for periodic advertising (type 0x20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodicAdvInfo {
+    /// Advertising data info (DI + DID).
+    pub adi: [u8; 2],
+    /// Periodic advertising interval in 1.25 ms units.
+    pub interval: u16,
+    /// Advertising address type (0 = public, 1 = random).
+    pub adva_type: u8,
+}
+
+impl PeriodicAdvInfo {
+    /// Encode into the 5-byte extended header field.
+    pub const fn encode(&self) -> [u8; 5] {
+        [
+            self.adi[0],
+            self.adi[1],
+            (self.interval & 0xFF) as u8,
+            (self.interval >> 8) as u8,
+            self.adva_type,
+        ]
+    }
+
+    /// Decode a 5-byte extended header field.
+    pub const fn decode(bytes: &[u8]) -> Option<PeriodicAdvInfo> {
+        if bytes.len() < 5 {
+            return None;
+        }
+        Some(PeriodicAdvInfo {
+            adi: [bytes[0], bytes[1]],
+            interval: u16::from_le_bytes([bytes[2], bytes[3]]),
+            adva_type: bytes[4],
+        })
     }
 }
 
@@ -765,6 +856,73 @@ mod ext_adv_tests {
                     data,
                     &[0x02, 0x01, 0x06, 0x05, 0x09, b'h', b'e', b'l', b'l', b'o']
                 );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod periodic_tests {
+    use super::*;
+
+    #[test]
+    fn periodic_info_roundtrip() {
+        let info = PeriodicAdvInfo {
+            adi: [0x11, 0x22],
+            interval: 640,
+            adva_type: 1,
+        };
+        let enc = info.encode();
+        assert_eq!(PeriodicAdvInfo::decode(&enc), Some(info));
+        assert_eq!(PeriodicAdvInfo::decode(&enc[..4]), None);
+    }
+
+    #[test]
+    fn periodic_pdu_roundtrip() {
+        let pdu = AdvPdu::PeriodicAdv {
+            adv_mode: 0,
+            adi: [0xAA, 0xBB],
+        };
+        let mut buf = [0u8; 16];
+        let n = pdu.encode(&mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..5], &[0x07, 0x06, 0x00, 0xAA, 0xBB]);
+        match AdvPdu::decode(&buf[..n]).unwrap() {
+            AdvPdu::PeriodicAdv { adv_mode, adi } => {
+                assert_eq!(adv_mode, 0);
+                assert_eq!(adi, [0xAA, 0xBB]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn aux_with_eh_roundtrip() {
+        let info = PeriodicAdvInfo {
+            adi: [0, 0],
+            interval: 100,
+            adva_type: 1,
+        };
+        let mut ehs = [0u8; 7];
+        ehs[0] = 1 + 5;
+        ehs[1] = EXT_AD_PERIODIC;
+        ehs[2..].copy_from_slice(&info.encode());
+        let pdu = AdvPdu::AuxAdvExtIndWithEh {
+            adv_addr: &[0xAA; 6],
+            adi: [0, 0],
+            ehs: &ehs,
+            data: &[0x02, 0x01, 0x06],
+        };
+        let mut buf = [0u8; 32];
+        let n = pdu.encode(&mut buf).unwrap();
+        assert_eq!(n, 2 + 8 + 7 + 3);
+        assert_eq!(buf[10], EXT_AD_PERIODIC);
+        let decoded = AdvPdu::decode(&buf[..n]).unwrap();
+        match decoded {
+            AdvPdu::AuxAdvExtInd { ext_type, data, .. } => {
+                assert_eq!(ext_type, EXT_AD_PERIODIC);
+                assert_eq!(data, &[0x02, 0x01, 0x06]);
             }
             _ => panic!("wrong variant"),
         }

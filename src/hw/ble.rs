@@ -55,6 +55,11 @@ pub struct AdvParams {
     /// Extended advertising: ADV_EXT_IND on the primary channels plus an
     /// auxiliary packet on a data channel carrying the full payload.
     pub extended: bool,
+    /// Periodic advertising: advertise the periodic info in the extended
+    /// header and send periodic packets on data channels.
+    pub periodic: bool,
+    /// Periodic advertising interval in 1.25 ms units.
+    pub periodic_interval: u16,
 }
 
 impl Default for AdvParams {
@@ -67,6 +72,8 @@ impl Default for AdvParams {
             peer_addr: None,
             channel_map: 0b111,
             extended: false,
+            periodic: false,
+            periodic_interval: 100,
         }
     }
 }
@@ -342,6 +349,9 @@ impl Ble {
         self.radio.transmit(&self.tx_buf[..self.tx_pdu_len]);
         if self.adv_params.extended {
             self.transmit_aux_adv();
+            if self.adv_params.periodic {
+                self.transmit_periodic_adv();
+            }
         } else {
             match self.adv_params.adv_type {
                 AdvType::ConnectableUndirected | AdvType::ConnectableDirected => {
@@ -636,11 +646,53 @@ impl Ble {
 
     fn transmit_aux_adv(&mut self) {
         let tx_add = self.own_addr_type.is_random();
-        let len = AdvPdu::AuxAdvExtInd {
-            adv_addr: &self.own_addr,
+        let mut data = [0u8; 36];
+        let n = self.adv_data_len.min(36);
+        data[..n].copy_from_slice(&self.adv_data[..n]);
+        let len = if self.adv_params.periodic {
+            let info = crate::ll::pdu::PeriodicAdvInfo {
+                adi: [0, 0],
+                interval: self.adv_params.periodic_interval,
+                adva_type: if self.own_addr_type.is_random() { 1 } else { 0 },
+            };
+            let mut ehs = [0u8; 40];
+            ehs[0] = 0;
+            ehs[1] = crate::ll::pdu::EXT_AD_PERIODIC;
+            ehs[2..7].copy_from_slice(&info.encode());
+            AdvPdu::AuxAdvExtIndWithEh {
+                adv_addr: &self.own_addr,
+                adi: [0, 0],
+                ehs: &ehs[..7],
+                data: &data[..n],
+            }
+            .encode_typed(&mut self.tx_buf, tx_add, false)
+            .unwrap()
+        } else {
+            AdvPdu::AuxAdvExtInd {
+                adv_addr: &self.own_addr,
+                adi: [0, 0],
+                ext_type: 0x00,
+                data: &data[..n],
+            }
+            .encode_typed(&mut self.tx_buf, tx_add, false)
+            .unwrap()
+        };
+        let deadline = self.timer.now().wrapping_add(timeout_ticks(200));
+        self.timer.set_compare(deadline);
+        while self.timer.now() < deadline {}
+        self.timer.clear_compare();
+        self.radio.set_channel(0).ok();
+        self.radio.transmit(&self.tx_buf[..len]);
+        self.radio
+            .set_channel(crate::ll::channels::ADV_CHANNELS[0])
+            .ok();
+    }
+
+    fn transmit_periodic_adv(&mut self) {
+        let tx_add = self.own_addr_type.is_random();
+        let len = AdvPdu::PeriodicAdv {
+            adv_mode: 0,
             adi: [0, 0],
-            ext_type: 0x00,
-            data: &self.adv_data[..self.adv_data_len],
         }
         .encode_typed(&mut self.tx_buf, tx_add, false)
         .unwrap();
