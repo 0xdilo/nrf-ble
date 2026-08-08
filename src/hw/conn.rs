@@ -255,6 +255,7 @@ pub struct Conn {
     rx_pdu_max: usize,
     pub coc: Option<Coc>,
     pub bond_store: RamBondStore,
+    pub peer_addr: [u8; 6],
     peer_version_ok: bool,
     pub last_rx: u32,
     terminate_pending: bool,
@@ -330,6 +331,7 @@ impl Conn {
             rx_pdu_max: LL_PDU_PAYLOAD_DEFAULT,
             coc: None,
             bond_store: RamBondStore::new(),
+            peer_addr: [0; 6],
             peer_version_ok: false,
             last_rx: now,
             terminate_pending: false,
@@ -911,7 +913,13 @@ impl Conn {
         self.tx_pending = true;
     }
 
-    fn queue_encrypt_req(&mut self) {
+    /// Set the peer address (used for bond lookups).
+    pub fn set_peer(&mut self, peer: [u8; 6]) {
+        self.peer_addr = peer;
+    }
+
+    /// Queue an LL_ENC_REQ with the current session key (master role).
+    pub fn queue_encrypt_req(&mut self) {
         let mut ctrl = [0u8; 19];
         ctrl[0] = LL_CONTROL_ENCRYPT_REQ;
         ctrl[1..9].fill(0);
@@ -1145,6 +1153,11 @@ impl Conn {
                     }
                     Err(_) => self.queue_att(&[0x01, 0x12, 0x00, 0x00, 0x12]),
                 }
+            }
+            0x52 => {
+                let handle = u16::from_le_bytes([att[1], att[2]]);
+                let value = &att[3..];
+                let _ = self.write(handle, value, result);
             }
             _ => {
                 self.queue_att(&[0x01, op, 0x00, 0x00, 0x06]);

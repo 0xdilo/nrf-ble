@@ -196,6 +196,7 @@ pub struct Ble {
     scan_cycle_start: u32,
     conn: Option<Conn>,
     connect_target: Option<[u8; 6]>,
+    conn_peer: [u8; 6],
     connect_target_type: AddrType,
     last_radio_channel: Option<u8>,
     accept_list: crate::ll::accept_list::AcceptList,
@@ -236,6 +237,7 @@ impl Ble {
             scan_cycle_start: 0,
             conn: None,
             connect_target: None,
+            conn_peer: [0; 6],
             connect_target_type: AddrType::Public,
             last_radio_channel: None,
             accept_list: crate::ll::accept_list::AcceptList::new(),
@@ -400,6 +402,27 @@ impl Ble {
             ..Default::default()
         };
         self.gap_scan_start(&params)
+    }
+
+    /// Encrypt the connection with a stored bond's LTK (master role).
+    ///
+    /// Queues LL_ENC_REQ with the session key; the handshake completes at
+    /// the next connection events.
+    pub fn gap_encrypt(&mut self) -> Result<(), Error> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Err(Error::NotRunning);
+        };
+        if conn.role != ConnRole::Master {
+            return Err(Error::InvalidParam);
+        }
+        let peer = conn.peer_addr;
+        let ltk = conn.bond_store.find(&peer).map(|b| b.ltk);
+        let Some(ltk) = ltk else {
+            return Err(Error::NotRunning);
+        };
+        conn.smp.stk = ltk;
+        conn.queue_encrypt_req();
+        Ok(())
     }
 
     /// Save a bond (LTK/IRK keyed by peer address) to the store.
@@ -883,7 +906,9 @@ impl Ble {
         self.connect_target = None;
         let now = self.timer.now();
         let channel = self.radio_last_channel().unwrap_or(37);
-        self.conn = Some(Conn::new(&ll, channel, now, ConnRole::Master, self.ccm));
+        let mut conn = Conn::new(&ll, channel, now, ConnRole::Master, self.ccm);
+        conn.set_peer(target);
+        self.conn = Some(conn);
         self.scan_state = ScanState::Idle;
         self.push_event(BleEvent::Connected { conn: ll });
         let _ = scannable;
