@@ -16,6 +16,63 @@ const SCAN_REQ_WINDOW_MICROS: u32 = 300;
 const CONNECT_REQ_WINDOW_MICROS: u32 = 90_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeriodicSync {
+    channel: u8,
+    units: u16,
+    frac: u32,
+    next_event: u32,
+}
+
+impl PeriodicSync {
+    fn next_interval(&mut self) -> u32 {
+        let base = u32::from(self.units) * 39;
+        self.frac += u32::from(self.units) * 2;
+        let carry = self.frac / 32;
+        self.frac %= 32;
+        base + carry
+    }
+}
+
+#[cfg(test)]
+mod periodic_sync_tests {
+    use super::PeriodicSync;
+
+    #[test]
+    fn interval_accumulation_is_exact() {
+        let mut sync = PeriodicSync {
+            channel: 0,
+            units: 100,
+            frac: 0,
+            next_event: 0,
+        };
+        // 100 units * 1.25 ms = 125 ms = 3906.25 ticks at 31.25 kHz
+        let mut total = 0u64;
+        for _ in 0..16 {
+            let d = sync.next_interval();
+            total += u64::from(d);
+            sync.next_event = sync.next_event.wrapping_add(d);
+        }
+        assert_eq!(total, (100 * 16 * 1250) / 32);
+    }
+
+    #[test]
+    fn odd_intervals_stay_drift_free() {
+        let mut sync = PeriodicSync {
+            channel: 0,
+            units: 33,
+            frac: 0,
+            next_event: 0,
+        };
+        let mut total = 0u64;
+        for _ in 0..1000 {
+            let d = sync.next_interval();
+            total += u64::from(d);
+        }
+        assert_eq!(total, (1000 * 33 * 1250) / 32);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Advertising type (legacy advertising PDU).
 pub enum AdvType {
     /// ADV_IND: connectable and scannable undirected.
@@ -144,6 +201,20 @@ pub enum BleEvent {
     LlControl(u8),
     /// The peer sent an L2CAP PDU on a non-ATT channel (channel ID).
     L2cap(u16),
+    /// A periodic advertising packet was received while synced.
+    PeriodicAdv {
+        /// Advertising data info.
+        adi: [u8; 2],
+        /// Received signal strength in dBm.
+        rssi: i8,
+    },
+    /// Periodic advertising sync was established.
+    PeriodicSynced {
+        /// Data channel of the periodic packets.
+        channel: u8,
+        /// Periodic interval in 1.25 ms units.
+        interval: u16,
+    },
     /// An advertising or scan response packet was received while scanning.
     ScanReport {
         /// Advertiser address.
@@ -196,11 +267,11 @@ pub struct Ble {
     scan_cycle_start: u32,
     conn: Option<Conn>,
     connect_target: Option<[u8; 6]>,
-    conn_peer: [u8; 6],
     connect_target_type: AddrType,
     last_radio_channel: Option<u8>,
     accept_list: crate::ll::accept_list::AcceptList,
     irk: Option<[u8; 16]>,
+    periodic_sync: Option<PeriodicSync>,
     ccm: &'static pac::ccm::RegisterBlock,
     tx_buf: [u8; RX_PDU_MAX],
     tx_pdu_len: usize,
@@ -237,11 +308,11 @@ impl Ble {
             scan_cycle_start: 0,
             conn: None,
             connect_target: None,
-            conn_peer: [0; 6],
             connect_target_type: AddrType::Public,
             last_radio_channel: None,
             accept_list: crate::ll::accept_list::AcceptList::new(),
             irk: None,
+            periodic_sync: None,
             ccm: ccm_regs,
             tx_buf: [0; RX_PDU_MAX],
             tx_pdu_len: 0,
@@ -520,6 +591,7 @@ impl Ble {
         if self.scan_state == ScanState::Idle {
             return;
         }
+        self.periodic_tick();
         self.timer.clear_compare();
         if self.scan_state == ScanState::StopPending {
             self.scan_state = ScanState::Idle;
@@ -914,6 +986,63 @@ impl Ble {
         let _ = scannable;
     }
 
+    fn handle_periodic_aux(&mut self, channel: u8, payload: &[u8]) {
+        if payload.len() < 15 {
+            return;
+        }
+        if let Some(info) = crate::ll::pdu::PeriodicAdvInfo::decode(&payload[10..15]) {
+            let now = self.timer.now();
+            let mut sync = PeriodicSync {
+                channel,
+                units: info.interval,
+                frac: 0,
+                next_event: now,
+            };
+            sync.next_event = sync.next_event.wrapping_add(sync.next_interval());
+            self.periodic_sync = Some(sync);
+            self.push_event(BleEvent::PeriodicSynced {
+                channel,
+                interval: info.interval,
+            });
+        }
+    }
+
+    fn periodic_tick(&mut self) {
+        let Some(mut sync) = self.periodic_sync else {
+            return;
+        };
+        let _ = &sync;
+        if self.timer.now() < sync.next_event {
+            return;
+        }
+        let delta = sync.next_interval();
+        sync.next_event = sync.next_event.wrapping_add(delta);
+        self.periodic_sync = Some(sync);
+        self.radio.set_channel(sync.channel).ok();
+        self.radio.receive_start(&mut self.rx_buf);
+        let mut spins = 0u32;
+        loop {
+            match self.radio.receive_poll(&self.rx_buf) {
+                Ok(Some(len)) => {
+                    if let Ok(AdvPdu::PeriodicAdv { adi, .. }) = AdvPdu::decode(&self.rx_buf[..len])
+                    {
+                        let rssi = self.radio.rssi();
+                        self.push_event(BleEvent::PeriodicAdv { adi, rssi });
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    spins += 1;
+                    if spins > 40_000 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        self.radio.receive_cancel();
+    }
+
     fn follow_aux(&mut self, ptr: &crate::ll::pdu::AuxPtr) -> Option<([u8; 6], [u8; 40], usize)> {
         self.radio.set_channel(ptr.channel).ok()?;
         let deadline = self.timer.now().wrapping_add(timeout_ticks(300));
@@ -925,13 +1054,27 @@ impl Ble {
         loop {
             match self.radio.receive_poll(&self.rx_buf) {
                 Ok(Some(len)) => {
-                    if let Ok(AdvPdu::AuxAdvExtInd { adv_addr, data, .. }) =
-                        AdvPdu::decode(&self.rx_buf[..len])
+                    let decoded = AdvPdu::decode(&self.rx_buf[..len]);
+                    if let Ok(AdvPdu::AuxAdvExtInd {
+                        adv_addr,
+                        ext_type,
+                        data,
+                        ..
+                    }) = decoded
                     {
+                        let is_periodic = ext_type == crate::ll::pdu::EXT_AD_PERIODIC;
                         let mut out = [0u8; 40];
                         let n = data.len().min(40);
                         out[..n].copy_from_slice(&data[..n]);
-                        return Some((*adv_addr, out, n));
+                        let addr = *adv_addr;
+                        let ch = ptr.channel;
+                        let mut raw = [0u8; 64];
+                        let raw_len = len.min(64);
+                        raw[..raw_len].copy_from_slice(&self.rx_buf[..raw_len]);
+                        if is_periodic {
+                            self.handle_periodic_aux(ch, &raw[..raw_len]);
+                        }
+                        return Some((addr, out, n));
                     }
                     break;
                 }

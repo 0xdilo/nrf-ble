@@ -397,78 +397,91 @@ impl Conn {
             return self.event_master(radio, timer);
         }
 
-        let listen_until = self.anchor.wrapping_add(timeout_ticks(2_000));
+        let mut result = ConnEvent::Idle;
         let mut received = false;
-        let mut ll = None;
-        timer.set_compare(listen_until);
-        radio.receive_start(&mut self.rx_buf);
+        let mut handled = 0u32;
         loop {
-            match radio.receive_poll(&self.rx_buf) {
-                Ok(Some(len)) => {
-                    if !self.rx(len) {
-                        radio.receive_cancel();
-                        break;
-                    }
-                    received = true;
-                    match DataPdu::decode(&self.rx_buf[..len]) {
-                        Ok(pdu) => {
-                            ll = Some(pdu);
+            let listen_until = timer.now().wrapping_add(timeout_ticks(2_000));
+            timer.set_compare(listen_until);
+            radio.receive_start(&mut self.rx_buf);
+            let mut ll = None;
+            loop {
+                match radio.receive_poll(&self.rx_buf) {
+                    Ok(Some(len)) => {
+                        if !self.rx(len) {
+                            radio.receive_cancel();
+                            break;
                         }
-                        Err(_) => return Err(Error::InvalidPdu),
+                        received = true;
+                        match DataPdu::decode(&self.rx_buf[..len]) {
+                            Ok(pdu) => {
+                                ll = Some(pdu);
+                            }
+                            Err(_) => return Err(Error::InvalidPdu),
+                        }
+                        break;
                     }
-                    break;
-                }
-                Ok(None) => {
-                    if timer.now() >= listen_until {
+                    Ok(None) => {
+                        if timer.now() >= listen_until {
+                            radio.receive_cancel();
+                            break;
+                        }
+                    }
+                    Err(_) => {
                         radio.receive_cancel();
                         break;
                     }
-                }
-                Err(_) => {
-                    radio.receive_cancel();
-                    break;
                 }
             }
+
+            if !received {
+                break;
+            }
+            self.last_rx = timer.now();
+
+            let pdu = ll.ok_or(Error::InvalidPdu)?;
+            let pdu_sn = pdu.sn;
+            let pdu_llid = pdu.llid;
+            let pdu_md = pdu.md;
+            let plen = pdu.payload.len().min(64);
+            let mut payload = [0u8; 64];
+            payload[..plen].copy_from_slice(&pdu.payload[..plen]);
+
+            if plen == 0 {
+                if pdu_sn != self.nesn {
+                    self.nesn = pdu_sn;
+                }
+            } else {
+                match pdu_llid {
+                    LLID_CONTROL => {
+                        if pdu_sn != self.nesn {
+                            self.nesn = pdu_sn;
+                        }
+                        match self.handle_ll_control(&payload[..plen], radio, timer) {
+                            Ok(()) => result = ConnEvent::Control(payload[0]),
+                            Err(reason) => {
+                                return Ok(ConnEvent::Disconnected(reason));
+                            }
+                        }
+                    }
+                    _ => {
+                        let new_data = pdu_sn != self.nesn;
+                        if new_data {
+                            self.nesn = pdu_sn;
+                        }
+                        self.handle_l2cap(&payload[..plen], pdu_llid, &mut result);
+                    }
+                }
+            }
+            handled += 1;
+            if !pdu_md || handled >= 4 {
+                break;
+            }
+            received = false;
         }
 
         if !received {
             return Ok(ConnEvent::Idle);
-        }
-        self.last_rx = timer.now();
-
-        let pdu = ll.ok_or(Error::InvalidPdu)?;
-        let pdu_sn = pdu.sn;
-        let pdu_llid = pdu.llid;
-        let plen = pdu.payload.len().min(64);
-        let mut payload = [0u8; 64];
-        payload[..plen].copy_from_slice(&pdu.payload[..plen]);
-        let mut result = ConnEvent::Idle;
-
-        if plen == 0 {
-            if pdu_sn != self.nesn {
-                self.nesn = pdu_sn;
-            }
-        } else {
-            match pdu_llid {
-                LLID_CONTROL => {
-                    if pdu_sn != self.nesn {
-                        self.nesn = pdu_sn;
-                    }
-                    match self.handle_ll_control(&payload[..plen], radio, timer) {
-                        Ok(()) => result = ConnEvent::Control(payload[0]),
-                        Err(reason) => {
-                            return Ok(ConnEvent::Disconnected(reason));
-                        }
-                    }
-                }
-                _ => {
-                    let new_data = pdu_sn != self.nesn;
-                    if new_data {
-                        self.nesn = pdu_sn;
-                    }
-                    self.handle_l2cap(&payload[..plen], pdu_llid, &mut result);
-                }
-            }
         }
 
         if self.terminate_pending {
