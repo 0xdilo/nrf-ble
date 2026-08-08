@@ -50,8 +50,19 @@
 
 pub mod error;
 pub mod gap;
+#[cfg(any(
+    feature = "nrf52811",
+    feature = "nrf52832",
+    feature = "nrf52833",
+    feature = "nrf52840"
+))]
 pub mod hci;
-#[cfg(any(feature = "nrf52811", feature = "nrf52832", feature = "nrf52840"))]
+#[cfg(any(
+    feature = "nrf52811",
+    feature = "nrf52832",
+    feature = "nrf52833",
+    feature = "nrf52840"
+))]
 pub mod hw;
 pub mod ll;
 #[cfg(feature = "sim")]

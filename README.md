@@ -54,6 +54,11 @@ PC Bluetooth adapter):
   set (advertising, scanning, connection, address, version) with stack
   events mapped to HCI events, so a host can drive the stack.
 - **Flash-backed bonding**: NVMC-based bond store (erase-on-save page).
+- **Write Without Response** (0x52), LL ping, unknown-opcode handling
+  (LL_UNKNOWN_RSP), bond re-encryption (gap_encrypt), multi-PDU
+  connection events (MD bit).
+- **HCI-UART bridge example**: an H4 bridge over UART0 ready for wired
+  transports (external J-Link VCOM is not wired to the target).
 - **Power**: optional `wfi` feature (WFI in the blocking loops).
 
 The PC's Bluetooth controller on this desk cannot transmit LE at all
@@ -62,7 +67,7 @@ CONNECT_REQs on air), and the second nRF is a bare-LL device with no
 L2CAP, so pairing/GATT could not be exercised against a live peer; both
 are covered by 64 host-side tests.
 
-Host-side (tested with `cargo test`, 104 tests):
+Host-side (tested with `cargo test`, 109 tests):
 
 - **Link Layer**: BLE CRC-24 (validated against the published check value
   `0xC25A56`), data whitening, advertising and data channel PDU codecs,
@@ -117,7 +122,7 @@ handler, test app) in release, `opt-level="s"` + fat LTO:
 
 | Component | Flash | RAM |
 |-----------|-------|-----|
-| nrf-ble stack + hwtest (everything above) | ~32 KB | ~1.5 KB |
+| nrf-ble stack + hwtest (everything above) | ~33 KB | ~1.5 KB |
 | SoftDevice S112 (the blob this replaces) | ~112 KB | ~4 KB+ reserved |
 
 The stack core is roughly 1-5 KB of code depending on what gets inlined.
@@ -189,7 +194,7 @@ handler, test app) in release, `opt-level="s"` + fat LTO:
 
 | Component | Flash | RAM |
 |-----------|-------|-----|
-| nrf-ble stack + hwtest (everything above) | ~32 KB | ~1.5 KB |
+| nrf-ble stack + hwtest (everything above) | ~33 KB | ~1.5 KB |
 | SoftDevice S112 (the blob this replaces) | ~112 KB | ~4 KB+ reserved |
 
 ## Hardware bring-up checklist
