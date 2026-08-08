@@ -17,24 +17,38 @@ use super::smp::{
 };
 use super::timers::{timeout_ticks, BtTimer, IntervalAccum};
 
-/// LL Control PDU opcode: LL_VERSION_IND.
-pub const LL_CONTROL_VERSION_IND: u8 = 0x0C;
-/// LL Control PDU opcode: LL_FEATURE_REQ.
-pub const LL_CONTROL_FEATURE_REQ: u8 = 0x1D;
-/// LL Control PDU opcode: LL_FEATURE_RSP.
-pub const LL_CONTROL_FEATURE_RSP: u8 = 0x1E;
+/// LL Control PDU opcode: LL_CONNECTION_UPDATE_REQ.
+pub const LL_CONTROL_CONNECTION_UPDATE_REQ: u8 = 0x00;
 /// LL Control PDU opcode: LL_TERMINATE_IND.
 pub const LL_CONTROL_TERMINATE_IND: u8 = 0x02;
-pub const LL_CONTROL_CONNECTION_UPDATE_REQ: u8 = 0x00;
-pub const LL_CONTROL_CONNECTION_UPDATE_RSP: u8 = 0x01;
-pub const LL_CONTROL_ENCRYPT_REQ: u8 = 0x07;
-pub const LL_CONTROL_ENCRYPT_RSP: u8 = 0x08;
-pub const LL_CONTROL_START_ENC_REQ: u8 = 0x09;
-pub const LL_CONTROL_START_ENC_RSP: u8 = 0x0A;
-pub const LL_CONTROL_PHY_REQ: u8 = 0x0E;
-pub const LL_CONTROL_PHY_RSP: u8 = 0x0F;
-pub const LL_CONTROL_LENGTH_REQ: u8 = 0x13;
-pub const LL_CONTROL_LENGTH_RSP: u8 = 0x14;
+/// LL Control PDU opcode: LL_ENC_REQ.
+pub const LL_CONTROL_ENCRYPT_REQ: u8 = 0x03;
+/// LL Control PDU opcode: LL_ENC_RSP.
+pub const LL_CONTROL_ENCRYPT_RSP: u8 = 0x04;
+/// LL Control PDU opcode: LL_START_ENC_REQ.
+pub const LL_CONTROL_START_ENC_REQ: u8 = 0x05;
+/// LL Control PDU opcode: LL_START_ENC_RSP.
+pub const LL_CONTROL_START_ENC_RSP: u8 = 0x06;
+/// LL Control PDU opcode: LL_UNKNOWN_RSP.
+pub const LL_CONTROL_UNKNOWN_RSP: u8 = 0x07;
+/// LL Control PDU opcode: LL_FEATURE_REQ.
+pub const LL_CONTROL_FEATURE_REQ: u8 = 0x08;
+/// LL Control PDU opcode: LL_FEATURE_RSP.
+pub const LL_CONTROL_FEATURE_RSP: u8 = 0x09;
+/// LL Control PDU opcode: LL_VERSION_IND.
+pub const LL_CONTROL_VERSION_IND: u8 = 0x0C;
+/// LL Control PDU opcode: LL_PING_REQ.
+pub const LL_CONTROL_PING_REQ: u8 = 0x12;
+/// LL Control PDU opcode: LL_PING_RSP.
+pub const LL_CONTROL_PING_RSP: u8 = 0x13;
+/// LL Control PDU opcode: LL_LENGTH_REQ.
+pub const LL_CONTROL_LENGTH_REQ: u8 = 0x14;
+/// LL Control PDU opcode: LL_LENGTH_RSP.
+pub const LL_CONTROL_LENGTH_RSP: u8 = 0x15;
+/// LL Control PDU opcode: LL_PHY_REQ.
+pub const LL_CONTROL_PHY_REQ: u8 = 0x16;
+/// LL Control PDU opcode: LL_PHY_RSP.
+pub const LL_CONTROL_PHY_RSP: u8 = 0x17;
 
 /// L2CAP channel ID for the ATT protocol.
 pub const L2CAP_ATT_CID: u16 = 0x0004;
@@ -1268,6 +1282,12 @@ impl Conn {
                 self.rx_pdu_max = max_rx.min(LL_PDU_PAYLOAD_MAX);
                 Ok(())
             }
+            LL_CONTROL_PING_REQ => {
+                let mut rsp = [0u8; 19];
+                rsp[0] = LL_CONTROL_PING_RSP;
+                self.pending_control = Some(rsp);
+                Ok(())
+            }
             LL_CONTROL_PHY_REQ => {
                 let mut rsp = [0u8; 19];
                 rsp[0] = LL_CONTROL_PHY_RSP;
@@ -1283,18 +1303,18 @@ impl Conn {
                     let interval = u16::from_le_bytes([payload[3], payload[4]]);
                     let timeout = u16::from_le_bytes([payload[7], payload[8]]);
                     let instant = u16::from_le_bytes([payload[9], payload[10]]);
-                    self.tx_buf[0] =
-                        (LLID_CONTROL & 0b11) | ((!self.nesn as u8) << 2) | ((self.sn as u8) << 3);
-                    self.tx_buf[1] = 2;
-                    self.tx_buf[2] = LL_CONTROL_CONNECTION_UPDATE_RSP;
-                    self.tx_buf[3] = 0;
-                    radio.transmit(&self.tx_buf[..4]);
                     self.pending_update = Some((interval, timeout));
                     self.pending_update_instant = instant;
                 }
                 Ok(())
             }
-            _ => Ok(()),
+            _ => {
+                let mut rsp = [0u8; 19];
+                rsp[0] = LL_CONTROL_UNKNOWN_RSP;
+                rsp[1] = payload[0];
+                self.pending_control = Some(rsp);
+                Ok(())
+            }
         }
     }
 
@@ -1938,5 +1958,72 @@ mod coc_tests {
         c.rx_coc_sdu(b"!", &mut result);
         assert_eq!(result, ConnEvent::Data);
         assert_eq!(&c.rx_data[..6], b"hello!");
+    }
+}
+
+#[cfg(test)]
+mod opcode_tests {
+    use super::*;
+
+    fn conn() -> Conn {
+        let params = ConnectReqData {
+            access_addr: 0x1234_ABCD,
+            crc_init: 0x654321,
+            win_size: 1,
+            win_offset: 0,
+            interval: 24,
+            latency: 0,
+            timeout: 2000,
+            channel_map: [0xFF, 0xFF, 0xFF, 0xFF, 0x1F],
+            hop: 13,
+            sca: 2,
+        };
+        Conn::new(&params, 37, 0, ConnRole::Slave, ccm_regs())
+    }
+
+    fn ccm_regs() -> &'static pac::ccm::RegisterBlock {
+        unsafe { &*pac::CCM::ptr() }
+    }
+
+    #[test]
+    fn ll_control_opcodes_match_spec() {
+        assert_eq!(LL_CONTROL_CONNECTION_UPDATE_REQ, 0x00);
+        assert_eq!(LL_CONTROL_TERMINATE_IND, 0x02);
+        assert_eq!(LL_CONTROL_ENCRYPT_REQ, 0x03);
+        assert_eq!(LL_CONTROL_ENCRYPT_RSP, 0x04);
+        assert_eq!(LL_CONTROL_START_ENC_REQ, 0x05);
+        assert_eq!(LL_CONTROL_START_ENC_RSP, 0x06);
+        assert_eq!(LL_CONTROL_UNKNOWN_RSP, 0x07);
+        assert_eq!(LL_CONTROL_FEATURE_REQ, 0x08);
+        assert_eq!(LL_CONTROL_FEATURE_RSP, 0x09);
+        assert_eq!(LL_CONTROL_VERSION_IND, 0x0C);
+        assert_eq!(LL_CONTROL_PING_REQ, 0x12);
+        assert_eq!(LL_CONTROL_PING_RSP, 0x13);
+        assert_eq!(LL_CONTROL_LENGTH_REQ, 0x14);
+        assert_eq!(LL_CONTROL_LENGTH_RSP, 0x15);
+        assert_eq!(LL_CONTROL_PHY_REQ, 0x16);
+        assert_eq!(LL_CONTROL_PHY_RSP, 0x17);
+    }
+
+    #[test]
+    fn ping_is_answered_with_ping_rsp() {
+        let mut c = conn();
+        let payload = [LL_CONTROL_PING_REQ];
+        let r = Radio::dummy();
+        let t = BtTimer::dummy();
+        c.handle_ll_control(&payload, &r, &t).unwrap();
+        let rsp = c.pending_control.unwrap();
+        assert_eq!(rsp[0], LL_CONTROL_PING_RSP);
+    }
+
+    #[test]
+    fn unknown_opcode_gets_unknown_rsp() {
+        let mut c = conn();
+        let r = Radio::dummy();
+        let t = BtTimer::dummy();
+        c.handle_ll_control(&[0x7F], &r, &t).unwrap();
+        let rsp = c.pending_control.unwrap();
+        assert_eq!(rsp[0], LL_CONTROL_UNKNOWN_RSP);
+        assert_eq!(rsp[1], 0x7F);
     }
 }
